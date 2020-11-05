@@ -1,12 +1,91 @@
 #!/usr/bin/python3
 
 import sys, operator
+from collections import defaultdict
 
 from pycparser import c_parser, c_ast, c_generator, parse_file
 g = c_generator.CGenerator()
 
+from lxml import etree
+
+# =============================================================================
+# Documentation Data Classes
+# =============================================================================
+
+class LibXML2_Doc_Function():
+    __slots__ = ('name', 'file', 'module', 'cond', 'info', 'returns', 'args')
+    def __init__(self, **kw):
+        for k, v in kw.items(): setattr(self, k, v)
+
+    def __repr__(self):
+        return "%s %s %s" % (self.returns, self.name, self.args)
+
+    @staticmethod
+    def from_xmlnode(node):
+        d = dict(
+            name     = node.attrib['name'],
+            file     = node.attrib['file'],
+            module   = node.attrib['module'],
+            cond     = None,
+            info     = None,
+            returns  = None,
+            args     = [])
+
+        for n in node:
+            if   n.tag == 'cond':   d['cond'] = n.text
+            elif n.tag == 'info':   d['info'] = n.text
+            elif n.tag == 'arg':    d['args'].append(LibXML2_Doc_Arg.from_xmlnode(n))
+            elif n.tag == 'return': d['returns'] = LibXML2_Doc_Return.from_xmlnode(n)
+        return LibXML2_Doc_Function(**d)
+
+class LibXML2_Doc_Arg():
+    __slots__ = ('name', 'type', 'info')
+    def __init__(self, **kw):
+        for k, v in kw.items(): setattr(self, k, v)
+
+    def __repr__(self):
+        return "%s %s" % (self.type, self.name)
+
+    @staticmethod
+    def from_xmlnode(node):
+        return LibXML2_Doc_Arg(
+            name=node.attrib.get('name'),
+            type=node.attrib.get('type'),
+            info=node.attrib.get('info'))
+
+class LibXML2_Doc_Return():
+    __slots__ = ('type', 'info')
+    def __init__(self, **kw):
+        for k, v in kw.items(): setattr(self, k, v)
+
+    def __repr__(self):
+        return self.type
+
+    @staticmethod
+    def from_xmlnode(node):
+        return LibXML2_Doc_Return(
+            type=node.attrib.get('type'),
+            info=node.attrib.get('info',''))
+
+# =============================================================================
+
+class LibXML2_Function():
+    __slots__ = ('doc', 'ast', 'own', 'ignore', 'free', 'this')
+    def __init__(self, **kw):
+        for s in self.__slots__: setattr(self, s, kw.get(s, None))
+
+    def __repr__(self):
+        return repr(self.doc)
+
+def contains(string, *search):
+    for s in search:
+        if s in string: return True
+    return False
+
+# ./doc/apibuild.py
 # free functions:  free in name and one param
 # owned functions: create/new/copy and ptr return value
+# functions: where to note the this parameter?
 
 class Meta(c_ast.NodeVisitor):
     def __init__(self, ast):
@@ -35,116 +114,48 @@ class Result():
         x = ''
         if type(self.node) is c_ast.IdentifierType:
             x = ' '.join(self.node.names)
+        elif type(self.node) is c_ast.Struct:
+            x = self.node.name
         elif self.next:
             x = str(self.next)
 
         return '(%s %s %s)' % (type(self.node).__name__, ' '.join(self.quals), x)
 
-    #TODO: class Identifier
-    #def cmp(self, other):
-    #    while self and other:
-    #        self_type = type(self.node)
-    #        other_type = type(self.other)
-    #        if self_type is not other_type:
-    #            return ORDER.index(self_type) - ORDER.index(other_type)
-
-    #        if self_type is c_ast.IdentifierType:
-
-    def cmp_foo(self, other, operator=operator.eq):
-        ORDER = [c_ast.IdentifierType, c_ast.PtrDecl]
-
-        self_T, other_T = type(self.node), type(other.node)
-        if self_T is other_T:
-            if self_T is c_ast.IdentifierType:
-                self_ID, other_ID = make_id(self.node.names), make_id(other.node.names)
-                if self_ID and other_ID:  return operator(self_ID, other_ID)
-                if self_ID:               return operator(1, 0)
-                if other_ID:              return operator(0, 1)
-                return                    operator(self.node.names, other.node.names)
-
-            elif self_T is c_ast.Struct:
-                return operator(self.node.name, other.node.name)
-
-        else:
-            return operator(ORDER.index(self_T), ORDER.index(other_T))
-
-        print(self.quals, other.quals)
-        #return operator(self.quals, other.quals)
-
-    def cmp(self, other, operator=operator.eq):
-        if not self.cmp_foo(other, operator): return False
-        if self.next and other.next:          return self.next.cmp(other.next, operator)
-        if self.next:                         return operator(1, 0)
-        if other.next:                        return operator(0, 1)
-        if self.next and other.next:          return operator(0, 0)
-
-    def __lt__(self, other):
-        return self.cmp(other, operator.lt)
-        while self and other:
-            if self.quals < other.quals: return True
-            self  = self.next
-            other = other.next
-        return not self and other
-
-    def __gt__(self, other):
-        return self.cmp(other, operator.gt)
-        if self.quals > other.quals: return True
-        if self.next and other.next: return self.next > other.next
-        return False
-
     def __eq__(self, other):
-        return self.cmp(other, operator.eq)
         while self and other:
             if self.quals != other.quals:           return False
             if type(self.node) != type(other.node): return False
+            t = type(self.node)
+            if t is c_ast.Struct:
+                if self.node.name != other.node.name: return False
             self, other = self.next, other.next
         return True
 
-    def __ne__(self, other):
-        return not(self.__eq__(self, other))
+    def __hash__(self):
+        # TODO: Include qualifiers in hash value
+        return id(type(self.node)) + hash(self.next)
 
-class Normalizer():
-    def __init__(self, meta):
-        self.meta = meta
-        self.result = Result(None, [])
-        self.last = self.result
-        self.quals = set()
+def normalize(node, meta):
+    return normalize_impl(node, meta, Result(None, []), set()).next
 
-    def run(self, ast):
-        self.visit(ast)
-        return self.result.next
-
-    def visit(self, node):
-        T = type(node)
-        if T is c_ast.Decl:
-            pass
-        elif T in (c_ast.Typedef, c_ast.TypeDecl):
-            self.quals.update(node.quals)
-        elif T is c_ast.PtrDecl:
-            self.quals.update(node.quals)
-            self.last.next = Result(node, self.quals)
-            self.last = self.last.next
-            self.quals = set()
-        elif T is c_ast.IdentifierType:
-            n = self.meta.resolve_identifier(node.names[0])
-            if n:
-                self.visit(n)
-            else:
-                self.last.next = Result(node, self.quals)
-                self.last = self.last.next
-                self.quals = set()
-            return  #XXX
-        elif T in (c_ast.Struct, c_ast.Enum, c_ast.FuncDecl):
-            self.last.next = Result(node, self.quals)
-            self.last = self.last.next
-            self.quals = set()
-            return  #XXX
-        else:
-            print(node)
-            raise
-
-        self.visit(node.type)
-
+def normalize_impl(node, meta, result, quals):
+    T = type(node)
+    if T is c_ast.Decl:
+        normalize_impl(node.type, meta, result, quals)
+    elif T in (c_ast.Typedef, c_ast.TypeDecl, c_ast.Typename):
+        normalize_impl(node.type, meta, result, quals | set(node.quals))
+    elif T is c_ast.PtrDecl:
+        result.next = Result(node, quals | set(node.quals))
+        normalize_impl(node.type, meta, result.next, set())
+    elif T is c_ast.IdentifierType:
+        n = meta.resolve_identifier(node.names[0])
+        if n: normalize_impl(n, meta, result, quals)
+        else: result.next = Result(node, quals)
+    elif T in (c_ast.Struct, c_ast.Enum, c_ast.FuncDecl):
+        result.next = Result(node, quals)
+    else:
+        raise Exception(node)
+    return result
 
 def FuncDecl_get_name(node): # TODO: rename
     typ = type(node)
@@ -152,24 +163,6 @@ def FuncDecl_get_name(node): # TODO: rename
     elif typ is c_ast.FuncDecl: return FuncDecl_get_name(node.type)
     elif typ is c_ast.PtrDecl:  return FuncDecl_get_name(node.type)
     raise
-
-def get_funcs(ast):
-    class FuncDefVisitor(c_ast.NodeVisitor):
-        def __init__(self, ast):
-            self.xml_funcs = []
-            self.free_funcs = []
-            self.visit(ast)
-
-        def visit_FuncDecl(self, node):
-            name = FuncDecl_get_name(node)
-            if name and name.startswith('xml'):
-                if 'free' in name.lower():
-                    self.free_funcs.append(node)
-                else:
-                    self.xml_funcs.append(node)
-
-    x = FuncDefVisitor(ast)
-    return x.xml_funcs, x.free_funcs
 
 def make_id(names):
     ID = 0
@@ -202,7 +195,7 @@ def compare_identifier(names_a, names_b):
     id_b = make_id(names_b)
     return id_a == id_b
 
-print(unpack_id(make_id(['long','long'])))
+#print(unpack_id(make_id(['long','long'])))
 #print(bin(make_id(['char', 'char', 'char'])))
 #print(unpack_id(make_id(['char', 'char', 'char'])))
 #print(bin(make_id(['char', 'char' ])))
@@ -238,115 +231,93 @@ def Decl_name(node, default=None):
 
 
 def show_func_defs(filename):
-    parser = c_parser.CParser()
+    funcs = {}
+
+    # Step 1: Extract function documentation from libxml2-api.xml
+    for section in etree.parse('doc/libxml2-api.xml').getroot():
+        if section.tag == 'symbols':
+            for symbol in section:
+                if symbol.tag == 'function':
+                    funcs[symbol.attrib['name']] = LibXML2_Function(
+                        doc=LibXML2_Doc_Function.from_xmlnode(symbol))
+
+    # Step 2: Parse header files
     ast = parse_file(filename, use_cpp=True,
         cpp_path='gcc',
         cpp_args=[
         '-E',
         '-D__attribute__(x)=',
-#       '-nostdinc',
-       '-I.',
-       '-Ifake_libc_include',
+        '-I.',
+        '-Ifake_libc_include',
         '-I/usr/include/libxml2',
-#        '-undef',
-#        '-I/usr/include',
-    ], parser=parser)
-
-    xml_funcs, free_funcs = get_funcs(ast)
-    #v = FuncDefVisitor()
-    #v.visit(ast)
+        # '-nostdinc', '-undef', '-I/usr/include',
+    ])
     meta = Meta(ast)
 
-    for node in free_funcs:
-        nparams = FuncDecl_param_count(node)
-        if nparams == 1:
-            f = 'template<> void xmlGenericFree<{TYPE}>({TYPE} {NAME}) {{ {FUNC}({NAME}); }}'.format(
-                FUNC = FuncDecl_get_name(node),
-                TYPE = Decl_type(node.args.params[0].type),
-                NAME = Decl_name(node.args.params[0])
-            )
+    # Step 3: Add AST to functions
+    class FuncDefVisitor(c_ast.NodeVisitor):
+        def visit_FuncDecl(self, node):
+            name = FuncDecl_get_name(node)
+            try:    funcs[name].ast = node
+            except: print('Skipping',name,'...')
 
-            print(f)#, node.args.params[0].type)
+    FuncDefVisitor().visit(ast)
 
-            #print(g.visit(node.args))
-            #for a in node.args:
-            #    print(a)
+    for f in funcs.values():
+        # Free() functions
+        if 'Free' in f.doc.name and len(f.doc.args) == 1:
+            f.free = True
 
-    #xml_funcs.sort(key=FuncDecl_get_name)
-    #xml_funcs.sort(key=lambda n: Decl_type(n.args.params[0].type).replace('const', ''))
+        if contains(f.doc.name, 'Create', 'New',' Copy'):
+            f.own = True
 
-    #for node in xml_funcs:
-    #    print(
-    #        Decl_type(node.args.params[0].type).replace('const', ''), '  ',
-    #        FuncDecl_get_name(node), '(', g.visit(node.args), ')', sep='')
+        if contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree'):
+            f.own = True
 
-    #print('%s at %s' % (node.decl.name, node.decl.coord))
-    #print('%s at %s' % (node.name, node.coord))
-    #print(node.args)
+        for i, arg in enumerate(f.doc.args):
+            if contains(arg.type, 'Ptr', '*'):
+                f.this = i
+                break
 
-    #print(type_defs['xmlBuffer'])
-    #print(type_defs['xmlBufferPtr'])
-    #print(xml_funcs[0].args.params[1])
-    #print(struct_defs['_xmlBuffer'])
+    # Collect all the ...
+    struct_bindings = defaultdict(list)
+    for f in funcs.values():
+        if f.ast is not None and f.this is not None:
+            #print(f.doc.name, normalize(f.ast.args.params[f.this], meta))
+            n = normalize(f.ast.args.params[f.this], meta)
+            struct_bindings[n].append(f)
 
-    ##  a = parser.parse('''
-    ##      typedef int* int_p;
-    ##      const int_p p;
-    ##      int* const p3;
-    ##      const int* p2;
-    ##      const int* const p4;
-    ##      const int LOL;
-    ##      int const LOL2;''').ext
-    ##  meta = Meta(a)
-    ##  #print(a[1])
-    ##  print(Normalizer(meta).run(a[1]))
-    ##  print(Normalizer(meta).run(a[2]))
-    ##  #print(a[3])
-    ##  print(Normalizer(meta).run(a[3]))
-    ##  print(Normalizer(meta).run(a[4]))
-    ##  #print(a[5])
-    ##  #print(a[6])
-    ##  #raise
+    # Blooooh
+    for struct_type, functions in struct_bindings.items():
+        write_class(struct_type, functions)
 
-    #def is_same_type(a, b):
-    #    a = resolve(a)
-    #    b = resolve(b)
-    #    typ_a = type(a)
-    #    typ_b = type(b)
-    #    if typ_a == typ_b:
-    #        if typ_a is c_ast.PtrDecl:
-    #            return a.quals == b.quals and is_same_type(a.type, b.type)
-    #        elif typ_a is c_ast.Struct:
-    #            return a.name == b.name
 
-    #    return False
-    #    #print(a)
-    #    #print(b)
-    #    #a = resolve(a.type)
-    #    #b = resolve(b.type)
-    #    #print(a)
-    #    #print(b)
+def write_class(struct_type, functions):
+    # Group functions by preprocessor conditions
+    conditions = defaultdict(list)
+    for f in functions:
+        conditions[f.doc.cond].append(f)
+    # And sort by function name
+    for functions in conditions.values():
+        functions.sort(key=lambda f: f.doc.name)
 
-    #print( is_same_type(type_defs['xmlBufferPtr'], xml_funcs[0].args.params[1]))
+    print('class %s {' % struct_type)
 
-    norm = Normalizer(meta)
-    xml_funcs.sort(key=lambda f: norm.run(f.args.params[0].type))
-    for node in xml_funcs:
-        print(
-            Decl_type(node.args.params[0].type).replace('const', ''), '  ',
-            FuncDecl_get_name(node), '(', g.visit(node.args), ')', sep='')
+    # First, functions that have no preprocessor conditions
+    for f in conditions.pop(None, []): write_function(f)
 
-    xmlStrcat = next(filter(lambda n: FuncDecl_get_name(n) == 'xmlStrcat', xml_funcs))
-    def is_same_type(a,b):
-        return norm.run(a) == norm.run(b)
-    print(is_same_type(xmlStrcat.args.params[0], xmlStrcat.args.params[1]))
-    #print(next(filter(lambda n: FuncDecl_get_name(n) == 'xmlGetGlobalState', xml_funcs)))
-    #print(parser.parse('unsigned signed int * p;').ext[0])
-    #print(parser.parse('const int * p;').ext[0])
-    #print(a[0], a[1], a[2])
-    #print(parser.parse('unsigned int p;'))
+    # Second, functions that have preprocessor conditions
+    for condition, functions in conditions.items():
+        print('#if', condition)
+        for f in functions: write_function(f)
+        print('#endif')
+
+    print('};')
+
+def write_function(function):
+    print('\t%s %s %s { }' % (function.doc.returns.type, function.doc.name, function.doc.args))
+
 
 if __name__ == "__main__":
     for filename in sys.argv[1:]:
         show_func_defs(filename)
-
