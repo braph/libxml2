@@ -2,24 +2,27 @@
 
 import sys, re
 from collections import defaultdict
-
-from pycparser import c_parser, c_ast, c_generator, parse_file
-from lxml import etree
-
-# TODO: `cur` is a good indicator for THIS?
+from lxml        import etree
+from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # =============================================================================
 # Util
 # =============================================================================
-def log(*a,**kw): print(*a,**kw,file=sys.stderr)
+
+def log(*a, **kw): print(*a, **kw, file=sys.stderr)
 ast_to_c = c_generator.CGenerator().visit
+def contains(string, *search):
+    for s in search:
+        if s in string:
+            return True
+
 #def Decl_to_c(node): return ast_to_c(node.args)
 
 # =============================================================================
-# Documentation Data Classes
+# LibXML2 API Documentation Data Classes
 # =============================================================================
 
-class LibXML2_Doc_Function():
+class API_Doc_Function():
     __slots__ = ('name', 'file', 'module', 'cond', 'info', 'returns', 'args')
     def __init__(self, **kw):
         for k, v in kw.items(): setattr(self, k, v)
@@ -29,7 +32,7 @@ class LibXML2_Doc_Function():
 
     @staticmethod
     def from_xmlnode(node):
-        d = dict(
+        r = API_Doc_Function(
             name     = node.attrib['name'],
             file     = node.attrib['file'],
             module   = node.attrib['module'],
@@ -39,13 +42,13 @@ class LibXML2_Doc_Function():
             args     = [])
 
         for n in node:
-            if   n.tag == 'cond':   d['cond'] = n.text
-            elif n.tag == 'info':   d['info'] = n.text
-            elif n.tag == 'arg':    d['args'].append(LibXML2_Doc_Arg.from_xmlnode(n))
-            elif n.tag == 'return': d['returns'] = LibXML2_Doc_Return.from_xmlnode(n)
-        return LibXML2_Doc_Function(**d)
+            if   n.tag == 'cond':   r.cond = n.text
+            elif n.tag == 'info':   r.info = n.text
+            elif n.tag == 'arg':    r.args.append(API_Doc_Arg.from_xmlnode(n))
+            elif n.tag == 'return': r.returns = API_Doc_Return.from_xmlnode(n)
+        return r
 
-class LibXML2_Doc_Arg():
+class API_Doc_Arg():
     __slots__ = ('name', 'type', 'info')
     def __init__(self, **kw):
         for k, v in kw.items(): setattr(self, k, v)
@@ -55,12 +58,12 @@ class LibXML2_Doc_Arg():
 
     @staticmethod
     def from_xmlnode(node):
-        return LibXML2_Doc_Arg(
-            name=node.attrib.get('name'),
-            type=node.attrib.get('type'),
-            info=node.attrib.get('info'))
+        return API_Doc_Arg(
+            name=node.attrib['name'],
+            type=node.attrib['type'],
+            info=node.attrib['info'])
 
-class LibXML2_Doc_Return():
+class API_Doc_Return():
     __slots__ = ('type', 'info')
     def __init__(self, **kw):
         for k, v in kw.items(): setattr(self, k, v)
@@ -70,24 +73,21 @@ class LibXML2_Doc_Return():
 
     @staticmethod
     def from_xmlnode(node):
-        return LibXML2_Doc_Return(
+        return API_Doc_Return(
             type=node.attrib.get('type'),
             info=node.attrib.get('info',''))
 
 # =============================================================================
 
 class LibXML2_Function():
+    ''' Data class that ties all available information about a function together '''
+
     __slots__ = ('doc', 'ast', 'own', 'ignore', 'free', 'this')
     def __init__(self, **kw):
         for s in self.__slots__: setattr(self, s, kw.get(s, None))
 
     def __repr__(self):
         return repr(self.doc)
-
-def contains(string, *search):
-    for s in search:
-        if s in string: return True
-    return False
 
 # ./doc/apibuild.py
 # free functions:  free in name and one param
@@ -139,6 +139,13 @@ class Result():
             t = type(self.node)
             if t is c_ast.Struct:
                 if self.node.name != other.node.name: return False
+            elif t is c_ast.IdentifierType:
+                try:
+                    if NormalizedIdentifier(self.node.names) != NormalizedIdentifier(other.node.names):
+                        return False
+                except:
+                    if self.node.names != other.node.names:
+                        return False
             self, other = self.next, other.next
         return True
 
@@ -159,7 +166,7 @@ def normalize_impl(node, meta, result, quals):
         result.next = Result(node, quals | set(node.quals))
         normalize_impl(node.type, meta, result.next, set())
     elif T is c_ast.IdentifierType:
-        n = meta.resolve_identifier(node.names[0])
+        n = meta.resolve_identifier(node.names[0]) # TODO: node.names
         if n: normalize_impl(n, meta, result, quals)
         else: result.next = Result(node, quals)
     elif T in (c_ast.Struct, c_ast.Enum, c_ast.FuncDecl):
@@ -175,51 +182,49 @@ def FuncDecl_get_name(node): # TODO: rename
     elif typ is c_ast.PtrDecl:  return FuncDecl_get_name(node.type)
     raise
 
-def make_id(names):
-    ID = 0
-    for name in names:
-        if   name == 'int':      pass
-        elif name == 'signed'  : pass
-        elif name == 'unsigned': ID |= 1
-        elif name == 'char':     ID += 1 << 2; ID |= (1 << 2)
-        elif name == 'short':    ID += 1 << 3; ID |= (1 << 3)
-        elif name == 'float':    ID += 1 << 4; ID |= (1 << 4)
-        elif name == 'double':   ID += 1 << 5; ID |= (1 << 5)
-        elif name == 'void':     ID += 1 << 6; ID |= (1 << 6)
-        elif name == 'long':     ID += 1 << 7; ID |= (1 << 7)
-        else: return names
-    return ID
+class NormalizedIdentifier():
+    __slots__ = ('signed', 'unsigned', 'char', 'short', 'long', 'int', 'float', 'double', 'void')
+    def __init__(self, names):
+        for name in self.__slots__:
+            setattr(self, name, 0)
+        for name in names:
+            setattr(self, name, getattr(self, name) + 1)
 
-def unpack_id(ID):
-    print('unpacked', ID)
-    return {
-        1<<2: 'char',
-        1<<3: 'short',
-        1<<4: 'float',
-        1<<5: 'double',
-        1<<6: 'void',
-        1<<7: 'long',
-        (1<<7)+(1<<7)+(1<<7): 'long long'}.get(ID, 'UNKNOWN')
+    def __eq__(self, other):
+        eq = (
+            bool(self.unsigned) == bool(other.unsigned) and
+            self.char           == other.char           and
+            self.float          == other.float          and
+            self.double         == other.double         and
+            self.void           == other.void           and
+            self.long           == other.long           and
+            bool(self.short)    == bool(other.short)
+        )
 
-def compare_identifier(names_a, names_b):
-    id_a = make_id(names_a)
-    id_b = make_id(names_b)
-    return id_a == id_b
+        if self.char: # Special case: char has 3 distinct signed types
+            eq &= (bool(self.signed) == bool(other.signed))
 
-#print(unpack_id(make_id(['long','long'])))
-#print(bin(make_id(['char', 'char', 'char'])))
-#print(unpack_id(make_id(['char', 'char', 'char'])))
-#print(bin(make_id(['char', 'char' ])))
-#print(unpack_id(make_id(['char', 'char'])))
-#print(unpack_id(make_id(['char'])))
-#raise
+        eq &= ( # TODO?
+            (self.int == other.int) or
+            bool(self.short or self.long) == bool(other.short or other.long))
 
-#print(compare_identifier(['signed'], ['unsigned']))
-#print(compare_identifier(['long'], ['long', 'int']))
-#print(compare_identifier(['signed'], ['int']))
-#print(compare_identifier(['signed', 'long'], ['long']))
-#print(compare_identifier(['signed', 'long', 'long'], ['long', 'long']))
-#print(compare_identifier(['long', 'long', 'signed'], ['long', 'long']))
+        return eq
+
+
+    def __str__(self):
+        l = []
+        for name in self.__slots__:
+            l.extend([name] * getattr(self, name))
+        return ' '.join(l)
+
+print( NormalizedIdentifier(['unsigned','char']) )
+assert NormalizedIdentifier(['char'])            == NormalizedIdentifier(['char'])
+assert NormalizedIdentifier(['unsigned','char']) != NormalizedIdentifier(['char'])
+assert NormalizedIdentifier(['signed',  'char']) != NormalizedIdentifier(['char'])
+assert NormalizedIdentifier(['short',   'int'])  == NormalizedIdentifier(['short'])
+assert NormalizedIdentifier(['long',    'int'])  == NormalizedIdentifier(['long'])
+assert NormalizedIdentifier(['signed'])          == NormalizedIdentifier(['int'])
+assert NormalizedIdentifier(['unsigned'])        == NormalizedIdentifier(['unsigned', 'int'])
 
 def FuncDecl_param_count(node):
     return len(node.args.params)
@@ -247,7 +252,7 @@ def show_func_defs(filename):
             for symbol in section:
                 if symbol.tag == 'function':
                     funcs[symbol.attrib['name']] = LibXML2_Function(
-                        doc=LibXML2_Doc_Function.from_xmlnode(symbol))
+                        doc=API_Doc_Function.from_xmlnode(symbol))
 
     # Step 2: Parse header files
     ast = parse_file(filename, use_cpp=True,
@@ -267,7 +272,7 @@ def show_func_defs(filename):
         def visit_FuncDecl(self, node):
             name = FuncDecl_get_name(node)
             try:    funcs[name].ast = node
-            except: log('Skipping',name,'...')
+            except: log('Function not found in api.xml:', name)
 
     FuncDefVisitor().visit(ast)
 
@@ -275,7 +280,7 @@ def show_func_defs(filename):
     for name in list(funcs.keys()):
         if funcs[name].ast is None:
             funcs.pop(name)
-            log('Dropping',name,'...')
+            log('Function not found in headers:', name)
 
     for f in funcs.values():
         # Free() functions contain 'free' and have 1 arg [of Ptr type] TODO
@@ -284,17 +289,19 @@ def show_func_defs(filename):
 
         # Own functions return Ptr ... TODO 'not be freed'
         if contains(f.doc.returns.type, 'Ptr', '*') and (
-            contains(f.doc.name, 'Create', 'New',' Copy') or
-            contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
+           contains(f.doc.name, 'Create', 'New',' Copy') or
+           contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
             f.own = True
 
+        # First argument should be a this pointer....
+        if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
+            f.this = 0
+
+        # But 'cur' is better!
         for i, arg in enumerate(f.doc.args):
             if arg.name == 'cur':
                 f.this = i
                 break
-
-        #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
-        #    f.this = 0
 
     # We don't want to process free functions
     for name in list(funcs.keys()):
@@ -315,6 +322,9 @@ def show_func_defs(filename):
             this_arg_type = normalize(f.ast.args.params[f.this], meta)
             this_arg_type.clear_qualifiers()
             struct_bindings[this_arg_type].append(f)
+
+
+    #for struct_bindings, functions in struct_bindings.items():
 
 
     # Blooooh
