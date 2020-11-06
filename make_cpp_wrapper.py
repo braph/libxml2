@@ -288,8 +288,13 @@ def show_func_defs(filename):
             contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
             f.own = True
 
-        if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
-            f.this = 0
+        for i, arg in enumerate(f.doc.args):
+            if arg.name == 'cur':
+                f.this = i
+                break
+
+        #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
+        #    f.this = 0
 
     # We don't want to process free functions
     for name in list(funcs.keys()):
