@@ -1,12 +1,19 @@
 #!/usr/bin/python3
 
-import sys, operator
+import sys, re
 from collections import defaultdict
 
 from pycparser import c_parser, c_ast, c_generator, parse_file
-g = c_generator.CGenerator()
-
 from lxml import etree
+
+# TODO: `cur` is a good indicator for THIS?
+
+# =============================================================================
+# Util
+# =============================================================================
+def log(*a,**kw): print(*a,**kw,file=sys.stderr)
+ast_to_c = c_generator.CGenerator().visit
+#def Decl_to_c(node): return ast_to_c(node.args)
 
 # =============================================================================
 # Documentation Data Classes
@@ -109,6 +116,10 @@ class Result():
         self.node = node
         self.quals = quals
         self.next = None
+
+    def clear_qualifiers(self):
+        self.quals.clear()
+        if self.next: self.next.clear_qualifiers()
 
     def __str__(self):
         x = ''
@@ -213,9 +224,6 @@ def compare_identifier(names_a, names_b):
 def FuncDecl_param_count(node):
     return len(node.args.params)
 
-def Decl_to_c(node):
-    return g.visit(node.args)
-
 def Decl_type(node):
     if type(node) == c_ast.PtrDecl:
         return Decl_type(node.type) + '*'
@@ -259,38 +267,80 @@ def show_func_defs(filename):
         def visit_FuncDecl(self, node):
             name = FuncDecl_get_name(node)
             try:    funcs[name].ast = node
-            except: print('Skipping',name,'...')
+            except: log('Skipping',name,'...')
 
     FuncDefVisitor().visit(ast)
 
+    # Drop functions that don't have the 'ast' attribute
+    for name in list(funcs.keys()):
+        if funcs[name].ast is None:
+            funcs.pop(name)
+            log('Dropping',name,'...')
+
     for f in funcs.values():
-        # Free() functions
+        # Free() functions contain 'free' and have 1 arg [of Ptr type] TODO
         if 'Free' in f.doc.name and len(f.doc.args) == 1:
             f.free = True
 
-        if contains(f.doc.name, 'Create', 'New',' Copy'):
+        # Own functions return Ptr ... TODO 'not be freed'
+        if contains(f.doc.returns.type, 'Ptr', '*') and (
+            contains(f.doc.name, 'Create', 'New',' Copy') or
+            contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
             f.own = True
 
-        if contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree'):
-            f.own = True
+        if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
+            f.this = 0
 
-        for i, arg in enumerate(f.doc.args):
-            if contains(arg.type, 'Ptr', '*'):
-                f.this = i
-                break
+    # We don't want to process free functions
+    for name in list(funcs.keys()):
+        if funcs[name].free:
+            funcs.pop(name)
 
     # Collect all the ...
     struct_bindings = defaultdict(list)
     for f in funcs.values():
-        if f.ast is not None and f.this is not None:
-            #print(f.doc.name, normalize(f.ast.args.params[f.this], meta))
-            n = normalize(f.ast.args.params[f.this], meta)
-            struct_bindings[n].append(f)
+        return_type = normalize(f.ast.type, meta)
+        return_type.clear_qualifiers()
+
+        if f.this is None:
+            if f.own:
+                # No THIS but returns an owning ptr -> bind it to class of owning ptr
+                struct_bindings[return_type].append(f)
+        else:
+            this_arg_type = normalize(f.ast.args.params[f.this], meta)
+            this_arg_type.clear_qualifiers()
+            struct_bindings[this_arg_type].append(f)
+
 
     # Blooooh
     for struct_type, functions in struct_bindings.items():
         write_class(struct_type, functions)
 
+def functionName_to_methodName(f, struct_type):
+    # xmlParserInputGrow, xmlParser
+    # TODO....
+
+    try: struct_type = struct_type.next.node.name
+    except: pass
+
+    f = re.sub('^_?(x|ht)ml', '', f) # 
+    if type(struct_type) is str:
+        struct_type = re.sub('^_?(x|ht)ml', '', struct_type)
+
+        common_prefix_len = 0
+        for c1, c2 in zip(f, struct_type):
+            if c1 != c2: break
+            common_prefix_len += 1
+
+        if common_prefix_len < 2:
+            common_prefix_len = 0
+
+        #print('<<<<<<<<<<<', f, struct_type, common_prefix)
+
+        return f[common_prefix_len:]
+
+    return f
+    return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
 
 def write_class(struct_type, functions):
     # Group functions by preprocessor conditions
@@ -301,22 +351,44 @@ def write_class(struct_type, functions):
     for functions in conditions.values():
         functions.sort(key=lambda f: f.doc.name)
 
-    print('class %s {' % struct_type)
+    print('class %s {' % StructType_to_class(struct_type))
 
     # First, functions that have no preprocessor conditions
-    for f in conditions.pop(None, []): write_function(f)
+    for f in conditions.pop(None, []):
+        print(write_function(f, struct_type))
 
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
         print('#if', condition)
-        for f in functions: write_function(f)
+        for f in functions: print(write_function(f, struct_type))
         print('#endif')
 
-    print('};')
+    print('};\n')
 
-def write_function(function):
-    print('\t%s %s %s { }' % (function.doc.returns.type, function.doc.name, function.doc.args))
+def StructType_to_class(struct_type):
+    try:
+        return re.sub('_(x|ht)ml', '', struct_type.next.node.name)
+    except:
+        return struct_type
 
+def write_function(function, struct_type):
+    # TODO: Drop THIS ptr.... (but only if it's a non-static method!)
+    s  = '  '
+    if function.this is None: s += 'static '
+    if function.own:          s += '(own) '
+    s += function.doc.returns.type
+    s += ' '
+    s += functionName_to_methodName(function.doc.name, struct_type)
+    s += '('
+    s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
+    s += ')'
+    s += '\n    { return '
+    s += function.doc.name
+    s += '('
+    s += ', '.join(['cobj()' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
+    s += '); '
+    s += '}'
+    return s
 
 if __name__ == "__main__":
     for filename in sys.argv[1:]:
