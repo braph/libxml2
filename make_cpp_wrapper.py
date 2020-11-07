@@ -1,9 +1,12 @@
 #!/usr/bin/python3
 
 import sys, re
+from copy        import deepcopy
 from collections import defaultdict
 from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
+
+# TODO: sometimes structs/char* is reallocated! rebind cobj then!
 
 # =============================================================================
 # Util
@@ -94,7 +97,7 @@ class LibXML2_Class():
     def __init__(self, struct_type=None):
         self.struct_type        = struct_type
         self.functions          = []
-        self.type_dependencies  = []
+        self.type_dependencies  = set()
 
 # ./doc/apibuild.py
 # free functions:  free in name and one param
@@ -112,13 +115,13 @@ class Meta(c_ast.NodeVisitor):
     def visit_Union(self, node):   self.unions[node.name]   = node
     def visit_Typedef(self, node): self.typedefs[node.name] = node
 
-    def resolve_identifier(self, name):
+    def resolve_identifier(self, name): # TODO use names[] array
         if name in self.typedefs: return self.typedefs[name]
         if name in self.structs:  return self.structs[name]
         if name in self.unions:   return self.unions[name]
         return None
 
-class Result():
+class Result(): # TODO rename
     def __init__(self, node, quals):
         self.node = node
         self.quals = quals
@@ -178,6 +181,8 @@ def normalize_impl(node, meta, result, quals):
         else: result.next = Result(node, quals)
     elif T in (c_ast.Struct, c_ast.Enum, c_ast.FuncDecl):
         result.next = Result(node, quals)
+    elif T is c_ast.EllipsisParam:
+        result.next = Result(node, quals) # TODO?
     else:
         raise Exception(node)
     return result
@@ -224,7 +229,7 @@ class NormalizedIdentifier():
             l.extend([name] * getattr(self, name))
         return ' '.join(l)
 
-print( NormalizedIdentifier(['unsigned','char']) )
+#print(NormalizedIdentifier(['unsigned','char']))
 assert NormalizedIdentifier(['char'])            == NormalizedIdentifier(['char'])
 assert NormalizedIdentifier(['unsigned','char']) != NormalizedIdentifier(['char'])
 assert NormalizedIdentifier(['signed',  'char']) != NormalizedIdentifier(['char'])
@@ -271,6 +276,8 @@ def show_func_defs(filename):
         '-I/usr/include/libxml2',
         # '-nostdinc', '-undef', '-I/usr/include',
     ])
+    #print(ast_to_c(ast))
+    #raise TODO
     meta = Meta(ast)
 
     # Step 3: Add AST to functions
@@ -282,12 +289,13 @@ def show_func_defs(filename):
 
     FuncDefVisitor().visit(ast)
 
-    # Drop functions that don't have the 'ast' attribute
+    # Step 4: Drop functions that don't have the 'ast' attribute
     for name in list(funcs.keys()):
         if funcs[name].ast is None:
             funcs.pop(name)
             log('Function not found in headers:', name)
 
+    # Step 5: ...
     for f in funcs.values():
         # Free() functions contain 'free' and have 1 arg [of Ptr type] TODO
         if 'Free' in f.doc.name and len(f.doc.args) == 1:
@@ -295,13 +303,25 @@ def show_func_defs(filename):
 
         # Own functions return Ptr ... TODO 'not be freed'
         if contains(f.doc.returns.type, 'Ptr', '*') and (
-           contains(f.doc.name, 'Create', 'New',' Copy') or
+           contains(f.doc.name, 'Create', 'New', 'Copy') or
            contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
             f.own = True
 
         # First argument should be a this pointer....
-        if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
-            f.this = 0
+        #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
+        #    f.this = 0
+
+        if len(f.doc.args):
+            first_arg = normalize(f.ast.args.params[0], meta)
+            if type(first_arg.node) is c_ast.PtrDecl:
+                if type(first_arg.next.node) is c_ast.Struct:
+                    f.this = 0
+                elif type(first_arg.next.node) is c_ast.IdentifierType:
+                    if NormalizedIdentifier(first_arg.next.node.names) == NormalizedIdentifier(['unsigned', 'char']):
+                        f.this = 0
+
+            #and type(normalize(f.ast.args.params[0], meta).node) is c_ast.PtrDecl:
+            #f.this = 0
 
         # But 'cur' is better!
         for i, arg in enumerate(f.doc.args):
@@ -315,7 +335,7 @@ def show_func_defs(filename):
             funcs.pop(name)
 
     # Collect all the ...
-    struct_bindings = defaultdict(LibXML2_Class)
+    klasses = defaultdict(LibXML2_Class)
     for f in funcs.values():
         return_type = normalize(f.ast.type, meta)
         return_type.clear_qualifiers()
@@ -323,20 +343,39 @@ def show_func_defs(filename):
         if f.this is None:
             if f.own:
                 # No THIS but returns an owning ptr -> bind it to class of owning ptr
-                struct_bindings[return_type].functions.append(f)
-                struct_bindings[return_type].struct_type = return_type # TODO
+                klasses[return_type].functions.append(f)
+                klasses[return_type].struct_type = return_type # TODO
         else:
             this_arg_type = normalize(f.ast.args.params[f.this], meta)
             this_arg_type.clear_qualifiers()
-            struct_bindings[this_arg_type].functions.append(f)
-            struct_bindings[this_arg_type].struct_type = this_arg_type # TODO
+            klasses[this_arg_type].functions.append(f)
+            klasses[this_arg_type].struct_type = this_arg_type # TODO
 
+    # We're only interested in the values...
+    klasses = list(klasses.values())
 
-    #for struct_bindings, functions in struct_bindings.items():
+    # Collect all dependencies for the classes
+    for klass in klasses:
+        for function in klass.functions:
+            return_type = normalize(function.ast.type, meta)
+            return_type.clear_qualifiers()
+            klass.type_dependencies.add(return_type)
+            for argument in function.ast.args.params:
+                arg_type = normalize(argument, meta)
+                arg_type.clear_qualifiers()
+                klass.type_dependencies.add(arg_type)
+
+    # Blah
+    klasses.sort(key=lambda k: len(k.type_dependencies))
+
+    # DUMP
+    #for klass in klasses:
+    #    print(klass.struct_type)
+    #    for x in klass.type_dependencies: print(' ', x)
 
     # Blooooh
-    for e in struct_bindings.values():
-        write_class(e)
+    for e in klasses:
+        write_class(e, meta)
 
 def functionName_to_methodName(f, struct_type):
     # xmlParserInputGrow, xmlParser
@@ -364,53 +403,70 @@ def functionName_to_methodName(f, struct_type):
     return f
     return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
 
-def write_class(struct_class):
-    struct_type = struct_class.struct_type
-    functions   = struct_class.functions
+def write_class(klass, meta):
+    # Sort alphabetically by function name
+    klass.functions.sort(key=lambda f: f.doc.name)
 
     # Group functions by preprocessor conditions
     conditions = defaultdict(list)
-    for f in functions:
+    for f in klass.functions:
         conditions[f.doc.cond].append(f)
-    # And sort by function name
-    for functions in conditions.values():
-        functions.sort(key=lambda f: f.doc.name)
 
-    print('class %s {' % StructType_to_class(struct_type))
+    print('class %s {' % StructType_to_class(klass.struct_type))
 
     # First, functions that have no preprocessor conditions
     for f in conditions.pop(None, []):
-        print(write_function(f, struct_type))
+        print(' ', write_method(f, klass.struct_type, meta))
 
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
         print('#if', condition)
-        for f in functions: print(write_function(f, struct_type))
+        for f in functions: print(' ', write_method(f, klass.struct_type, meta))
         print('#endif')
 
     print('};\n')
 
 def StructType_to_class(struct_type):
+    # TODO.... eeerm .... idk 
     try:
-        return re.sub('_(x|ht)ml', '', struct_type.next.node.name)
+        name = struct_type.next.node.name
+        name = name.lstrip('_')
+        name = re.sub('^(x|ht)ml', '', name)
+        return name
     except:
         return struct_type
 
-def write_function(function, struct_type):
-    # TODO: Drop THIS ptr.... (but only if it's a non-static method!)
-    s  = '  '
+def PtrType_to_class(ast, owns, meta):
+    normalized = normalize(ast, meta)
+    if type(normalized.node) == c_ast.PtrDecl:
+        if type(normalized.next.node) == c_ast.Struct: # TODO: or identifier.
+            name = '%s<%d>' %(normalized.next.node.name, bool(owns))
+            return re.sub('^_?(x|ht)ml', '', name).replace('Ptr','')
+
+    # TODO.... ach leck mich doch am arsch
+    ast = deepcopy(ast)
+    class ClearDeclname(c_ast.NodeVisitor):
+        def visit_TypeDecl(self, node):
+            node.declname = ''
+    ClearDeclname().visit(ast)
+    name = ast_to_c(c_ast.Typename('', [], ast))
+    return re.sub('^_?(x|ht)ml', '', name).replace('Ptr','')
+
+def write_method(function, struct_type, meta):
+    ''' Generate the code for a wrapped function '''
+    s  = 'inline '
     if function.this is None: s += 'static '
-    if function.own:          s += '(own) '
-    s += function.doc.returns.type
+    s += PtrType_to_class(function.ast.type, function.own, meta)
+    #s += '<%d>' % bool(function.own)
     s += ' '
     s += functionName_to_methodName(function.doc.name, struct_type)
     s += '('
     s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
     s += ')'
-    s += '\n    { return '
+    s += ' { return '
     s += function.doc.name
     s += '('
-    s += ', '.join(['cobj()' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
+    s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
     s += '); '
     s += '}'
     return s
