@@ -255,127 +255,139 @@ def Decl_type(node):
 def Decl_name(node, default=None):
     return node.name if node.name else default
 
-def show_func_defs(filename):
-    funcs = {}
+class Converter():
+    def __init__(self, filename):
+        self.filename = filename
+        self.funcs    = defaultdict(LibXML2_Function)
+        self.api_xml_file = 'doc/libxml2-api.xml'
+        self.ast      = None
+        self.meta     = None
 
-    # Step 1: Extract function documentation from libxml2-api.xml
-    for section in etree.parse('doc/libxml2-api.xml').getroot():
-        if section.tag == 'symbols':
-            for symbol in section:
-                if symbol.tag == 'function':
-                    funcs[symbol.attrib['name']] = LibXML2_Function(
-                        doc=API_Doc_Function.from_xmlnode(symbol))
+    def run(self):
+        self.collect_api_documentation()
+        self.parse_header_files()
+        self.add_ast_to_functions()
+        self.other_stuff()
 
-    # Step 2: Parse header files
-    ast = parse_file(filename, use_cpp=True,
-        cpp_path='gcc',
-        cpp_args=[
-        '-E',
-        '-D__attribute__(x)=',
-        '-I.',
-        '-Ifake_libc_include',
-        '-I/usr/include/libxml2',
-        # '-nostdinc', '-undef', '-I/usr/include',
-    ])
-    meta = Meta(ast)
+    def collect_api_documentation(self):
+        for section in etree.parse(self.api_xml_file).getroot():
+            if section.tag == 'symbols':
+                for symbol in section:
+                    if symbol.tag == 'function':
+                        self.funcs[symbol.attrib['name']].doc = API_Doc_Function.from_xmlnode(symbol)
 
-    # Step 3: Add AST to functions
-    class FuncDefVisitor(c_ast.NodeVisitor):
-        def visit_FuncDecl(self, node):
-            name = FuncDecl_get_name(node)
-            try:    funcs[name].ast = node
-            except: log('Function not found in api.xml:', name)
+    def parse_header_files(self):
+        self.ast = parse_file(self.filename, use_cpp=True,
+            cpp_path='gcc',
+            cpp_args=[
+            '-E',
+            '-D__attribute__(x)=',
+            '-I.',
+            '-Ifake_libc_include',
+            '-I/usr/include/libxml2',
+            # '-nostdinc', '-undef', '-I/usr/include',
+        ])
 
-    FuncDefVisitor().visit(ast)
+        self.meta = Meta(ast)
 
-    # Step 4: Drop functions that don't have the 'ast' attribute
-    for name in list(funcs.keys()):
-        if funcs[name].ast is None:
-            funcs.pop(name)
-            log('Function not found in headers:', name)
+    def add_ast_to_functions(self):
+        class FuncDefVisitor(c_ast.NodeVisitor):
+            def visit_FuncDecl(self, node):
+                name = FuncDecl_get_name(node)
+                try:    self.funcs[name].ast = node
+                except: log('Function not found in api.xml:', name)
 
-    # Step 5: ...
-    for f in funcs.values():
-        # Free() functions contain 'Free' and have 1 arg [of pointer type]
-        if 'Free' in f.doc.name and len(f.doc.args) == 1:
-            f.free = True
+        FuncDefVisitor().visit(ast)
 
-        # Own functions return Ptr ... TODO 'not be freed'
-        if contains(f.doc.returns.type, 'Ptr', '*') and (
-           contains(f.doc.name, 'Create', 'New', 'Copy') or
-           contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
-            f.own = True
+    def other_stuff(self):
+        # Step 4: Drop functions that don't have the 'ast' attribute
+        for name in list(funcs.keys()):
+            if funcs[name].ast is None:
+                funcs.pop(name)
+                log('Function not found in headers:', name)
 
-        # First argument should be a this pointer....
-        #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
-        #    f.this = 0
+        # Step 5: ...
+        for f in funcs.values():
+            # Free() functions contain 'Free' and have 1 arg [of pointer type]
+            if 'Free' in f.doc.name and len(f.doc.args) == 1:
+                f.free = True
 
-        # TODO...
-        if len(f.doc.args):
-            first_arg = meta.normalize_type(f.ast.args.params[0])
-            if type(first_arg.node) is c_ast.PtrDecl:
-                if type(first_arg.next.node) is c_ast.Struct:
-                    f.this = 0
-                elif type(first_arg.next.node) is c_ast.IdentifierType:
-                    if NormalizedIdentifier(first_arg.next.node.names) == NormalizedIdentifier(['unsigned', 'char']):
+            # Own functions return Ptr ... TODO 'not be freed'
+            if contains(f.doc.returns.type, 'Ptr', '*') and (
+               contains(f.doc.name, 'Create', 'New', 'Copy') or
+               contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
+                f.own = True
+
+            # First argument should be a this pointer....
+            #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
+            #    f.this = 0
+
+            # TODO...
+            if len(f.doc.args):
+                first_arg = meta.normalize_type(f.ast.args.params[0])
+                if type(first_arg.node) is c_ast.PtrDecl:
+                    if type(first_arg.next.node) is c_ast.Struct:
                         f.this = 0
+                    elif type(first_arg.next.node) is c_ast.IdentifierType:
+                        if NormalizedIdentifier(first_arg.next.node.names) == NormalizedIdentifier(['unsigned', 'char']):
+                            f.this = 0
 
-            #and type(normalize(f.ast.args.params[0], meta).node) is c_ast.PtrDecl:
-            #f.this = 0
+                #and type(normalize(f.ast.args.params[0], meta).node) is c_ast.PtrDecl:
+                #f.this = 0
 
-        # But 'cur' is better!
-        for i, arg in enumerate(f.doc.args):
-            if arg.name == 'cur':
-                f.this = i
-                break
+            # But 'cur' is better!
+            for i, arg in enumerate(f.doc.args):
+                if arg.name == 'cur':
+                    f.this = i
+                    break
 
-    # We don't want to process free functions
-    for name in list(funcs.keys()):
-        if funcs[name].free:
-            funcs.pop(name)
+        # We don't want to process free functions
+        for name in list(funcs.keys()):
+            if funcs[name].free:
+                funcs.pop(name)
 
-    # Collect all the ...
-    klasses = defaultdict(LibXML2_Class)
-    for f in funcs.values():
-        return_type = meta.normalize_type(f.ast.type)
-        return_type.clear_qualifiers()
-
-        if f.this is None:
-            if f.own:
-                # No THIS but returns an owning ptr -> bind it to class of owning ptr
-                klasses[return_type].functions.append(f)
-                klasses[return_type].struct_type = return_type # TODO
-        else:
-            this_arg_type = meta.normalize_type(f.ast.args.params[f.this])
-            this_arg_type.clear_qualifiers()
-            klasses[this_arg_type].functions.append(f)
-            klasses[this_arg_type].struct_type = this_arg_type # TODO
-
-    # We're only interested in the values...
-    klasses = list(klasses.values())
-
-    # Collect all dependencies for the classes
-    for klass in klasses:
-        for function in klass.functions:
-            return_type = meta.normalize_type(function.ast.type)
+        # Collect all the ...
+        klasses = defaultdict(LibXML2_Class)
+        for f in funcs.values():
+            return_type = meta.normalize_type(f.ast.type)
             return_type.clear_qualifiers()
-            klass.type_dependencies.add(return_type)
-            for argument in function.ast.args.params:
-                arg_type = meta.normalize_type(argument)
-                arg_type.clear_qualifiers()
-                klass.type_dependencies.add(arg_type)
 
-    # Blah
-    klasses.sort(key=lambda k: len(k.type_dependencies))
+            if f.this is None:
+                if f.own:
+                    # No THIS but returns an owning ptr -> bind it to class of owning ptr
+                    klasses[return_type].functions.append(f)
+                    klasses[return_type].struct_type = return_type # TODO
+            else:
+                this_arg_type = meta.normalize_type(f.ast.args.params[f.this])
+                this_arg_type.clear_qualifiers()
+                klasses[this_arg_type].functions.append(f)
+                klasses[this_arg_type].struct_type = this_arg_type # TODO
 
-    # DUMP
-    #for klass in klasses:
-    #    print(klass.struct_type)
-    #    for x in klass.type_dependencies: print(' ', x)
+        # We're only interested in the values...
+        klasses = list(klasses.values())
 
-    # Blooooh
-    for e in klasses:
-        write_class(e, meta)
+        # Collect all dependencies for the classes
+        for klass in klasses:
+            for function in klass.functions:
+                return_type = meta.normalize_type(function.ast.type)
+                return_type.clear_qualifiers()
+                klass.type_dependencies.add(return_type)
+                for argument in function.ast.args.params:
+                    arg_type = meta.normalize_type(argument)
+                    arg_type.clear_qualifiers()
+                    klass.type_dependencies.add(arg_type)
+
+        # Blah
+        klasses.sort(key=lambda k: len(k.type_dependencies))
+
+        # DUMP
+        #for klass in klasses:
+        #    print(klass.struct_type)
+        #    for x in klass.type_dependencies: print(' ', x)
+
+        # Blooooh
+        for e in klasses:
+            write_class(e, meta)
 
 def functionName_to_methodName(f, struct_type):
     # xmlParserInputGrow, xmlParser
@@ -474,4 +486,4 @@ def write_method(function, struct_type, meta):
 if __name__ == "__main__":
     # ./doc/apibuild.py
     for filename in sys.argv[1:]:
-        show_func_defs(filename)
+        Converter(filename).run()
