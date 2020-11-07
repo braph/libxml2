@@ -89,6 +89,13 @@ class LibXML2_Function():
     def __repr__(self):
         return repr(self.doc)
 
+class LibXML2_Class():
+    __slots__ = ('struct_type', 'functions', 'type_dependencies')
+    def __init__(self, struct_type=None):
+        self.struct_type        = struct_type
+        self.functions          = []
+        self.type_dependencies  = []
+
 # ./doc/apibuild.py
 # free functions:  free in name and one param
 # owned functions: create/new/copy and ptr return value
@@ -242,7 +249,6 @@ def Decl_type(node):
 def Decl_name(node, default=None):
     return node.name if node.name else default
 
-
 def show_func_defs(filename):
     funcs = {}
 
@@ -309,7 +315,7 @@ def show_func_defs(filename):
             funcs.pop(name)
 
     # Collect all the ...
-    struct_bindings = defaultdict(list)
+    struct_bindings = defaultdict(LibXML2_Class)
     for f in funcs.values():
         return_type = normalize(f.ast.type, meta)
         return_type.clear_qualifiers()
@@ -317,19 +323,20 @@ def show_func_defs(filename):
         if f.this is None:
             if f.own:
                 # No THIS but returns an owning ptr -> bind it to class of owning ptr
-                struct_bindings[return_type].append(f)
+                struct_bindings[return_type].functions.append(f)
+                struct_bindings[return_type].struct_type = return_type # TODO
         else:
             this_arg_type = normalize(f.ast.args.params[f.this], meta)
             this_arg_type.clear_qualifiers()
-            struct_bindings[this_arg_type].append(f)
+            struct_bindings[this_arg_type].functions.append(f)
+            struct_bindings[this_arg_type].struct_type = this_arg_type # TODO
 
 
     #for struct_bindings, functions in struct_bindings.items():
 
-
     # Blooooh
-    for struct_type, functions in struct_bindings.items():
-        write_class(struct_type, functions)
+    for e in struct_bindings.values():
+        write_class(e)
 
 def functionName_to_methodName(f, struct_type):
     # xmlParserInputGrow, xmlParser
@@ -357,7 +364,10 @@ def functionName_to_methodName(f, struct_type):
     return f
     return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
 
-def write_class(struct_type, functions):
+def write_class(struct_class):
+    struct_type = struct_class.struct_type
+    functions   = struct_class.functions
+
     # Group functions by preprocessor conditions
     conditions = defaultdict(list)
     for f in functions:
