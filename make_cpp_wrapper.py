@@ -36,8 +36,6 @@ def partition(iterable, predicate):
     for i in iterable: r[not bool(predicate(i))].append(i)
     return r
 
-#def Decl_to_c(node): return ast_to_c(node.args)
-
 # =============================================================================
 # LibXML2 API Documentation Data Classes
 # =============================================================================
@@ -98,23 +96,8 @@ class API_Doc_Return():
             info=node.attrib.get('info',''))
 
 # =============================================================================
-
-class LibXML2_Function():
-    ''' Data class that ties all available information about a function together '''
-
-    __slots__ = ('doc', 'ast', 'own', 'this')
-    def __init__(self, **kw):
-        for s in self.__slots__: setattr(self, s, kw.get(s, None))
-
-    def __repr__(self):
-        return repr(self.doc)
-
-class LibXML2_Class():
-    __slots__ = ('struct_type', 'functions', 'type_dependencies')
-    def __init__(self, struct_type=None):
-        self.struct_type        = struct_type
-        self.functions          = []
-        self.type_dependencies  = set()
+# AST Stuff
+# =============================================================================
 
 class Meta(c_ast.NodeVisitor):
     def __init__(self, ast):
@@ -230,10 +213,10 @@ class Result(): # TODO rename
 
 
 def FuncDecl_get_name(node): # TODO: rename
-    typ = type(node)
-    if   typ is c_ast.TypeDecl: return node.declname
-    elif typ is c_ast.FuncDecl: return FuncDecl_get_name(node.type)
-    elif typ is c_ast.PtrDecl:  return FuncDecl_get_name(node.type)
+    T = type(node)
+    if   T is c_ast.TypeDecl: return node.declname
+    elif T is c_ast.FuncDecl: return FuncDecl_get_name(node.type)
+    elif T is c_ast.PtrDecl:  return FuncDecl_get_name(node.type)
     raise
 
 class NormalizedIdentifier():
@@ -277,6 +260,25 @@ assert NormalizedIdentifier(['short',   'int'])  == NormalizedIdentifier(['short
 assert NormalizedIdentifier(['long',    'int'])  == NormalizedIdentifier(['long'])
 assert NormalizedIdentifier(['signed'])          == NormalizedIdentifier(['int'])
 assert NormalizedIdentifier(['unsigned'])        == NormalizedIdentifier(['unsigned', 'int'])
+
+# =============================================================================
+
+class LibXML2_Function():
+    ''' Data class that ties all available information about a function together '''
+
+    __slots__ = ('doc', 'ast', 'own', 'this')
+    def __init__(self, **kw):
+        for s in self.__slots__: setattr(self, s, kw.get(s, None))
+
+    def __repr__(self):
+        return repr(self.doc)
+
+class LibXML2_Class():
+    __slots__ = ('struct_type', 'functions', 'type_dependencies')
+    def __init__(self, struct_type=None):
+        self.struct_type        = struct_type
+        self.functions          = []
+        self.type_dependencies  = set()
 
 class Converter():
     def __init__(self, filename):
@@ -373,6 +375,7 @@ class Converter():
                 except:
                     pass #print(f.ast.args.params[f.this])
 
+
         # We're only interested in the values...
         klasses = list()
         for name, klass in klasses_.items():
@@ -404,7 +407,6 @@ class Converter():
             for x in klass.type_dependencies: print(' ', x)
         #raise
 
-        # Blooooh
         for e in klasses:
             write_class(self, e)
 
