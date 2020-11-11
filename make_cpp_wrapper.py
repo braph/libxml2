@@ -6,7 +6,14 @@ from collections import defaultdict
 from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
+# TODO: *EatName* functions
+# TODO: generate templated free-functions
+# TODO: generate copy/move constructors
+# TODO: don't bind on char*/void* 
 # TODO: sometimes structs/char* is reallocated! rebind cobj then!
+# TODO: constness on methods and return types
+# TODO: Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
+# TODO: Overloads: func(const char*) -> func(const char*), func(std::string)
 
 # =============================================================================
 # Util
@@ -21,6 +28,11 @@ def contains(string, *search):
     for s in search:
         if s in string:
             return True
+
+def partition(iterable, predicate):
+    r = ([],[])
+    for i in iterable: r[not bool(predicate(i))].append(i)
+    return r
 
 #def Decl_to_c(node): return ast_to_c(node.args)
 
@@ -88,7 +100,7 @@ class API_Doc_Return():
 class LibXML2_Function():
     ''' Data class that ties all available information about a function together '''
 
-    __slots__ = ('doc', 'ast', 'own', 'ignore', 'free', 'this')
+    __slots__ = ('doc', 'ast', 'own', 'this')
     def __init__(self, **kw):
         for s in self.__slots__: setattr(self, s, kw.get(s, None))
 
@@ -146,6 +158,23 @@ class Meta(c_ast.NodeVisitor):
             raise Exception(node)
         return result
 
+def AST_Find_All_Struct_Names(ast, meta):
+    class Visitor(c_ast.NodeVisitor):
+        def __init__(self):
+            self.types = set()
+        def visit_Struct(self, node):
+            self.types.add(node.name)
+        def visit_IdentifierType(self, node):
+            node = meta.resolve_identifier(node)
+            if node:
+                self.visit(node)
+    v = Visitor()
+    v.visit(ast)
+    return v.types
+
+def AST_Find_Struct_Name(ast, meta):
+    return AST_Find_All_Struct_Names(ast, meta).pop()
+
 class Result(): # TODO rename
     def __init__(self, node, quals):
         self.node = node
@@ -188,6 +217,7 @@ class Result(): # TODO rename
         # TODO: Include qualifiers in hash value
         return id(type(self.node)) + hash(self.next)
 
+
 def FuncDecl_get_name(node): # TODO: rename
     typ = type(node)
     if   typ is c_ast.TypeDecl: return node.declname
@@ -222,8 +252,6 @@ class NormalizedIdentifier():
                 or self.int == other.int)
         )
 
-
-
     def __str__(self):
         l = []
         for name in self.__slots__:
@@ -257,11 +285,12 @@ def Decl_name(node, default=None):
 
 class Converter():
     def __init__(self, filename):
-        self.filename = filename
-        self.funcs    = defaultdict(LibXML2_Function)
+        self.filename     = filename
+        self.funcs        = defaultdict(LibXML2_Function)
+        self.free_funcs   = {}
         self.api_xml_file = 'doc/libxml2-api.xml'
-        self.ast      = None
-        self.meta     = None
+        self.ast          = None
+        self.meta         = None
 
     def run(self):
         self.collect_api_documentation()
@@ -275,6 +304,7 @@ class Converter():
                 for symbol in section:
                     if symbol.tag == 'function':
                         self.funcs[symbol.attrib['name']].doc = API_Doc_Function.from_xmlnode(symbol)
+                        #print(self.funcs[symbol.attrib['name']].doc) TODO
 
     def parse_header_files(self):
         self.ast = parse_file(self.filename, use_cpp=True,
@@ -288,31 +318,30 @@ class Converter():
             # '-nostdinc', '-undef', '-I/usr/include',
         ])
 
-        self.meta = Meta(ast)
+        self.meta = Meta(self.ast)
 
     def add_ast_to_functions(self):
         class FuncDefVisitor(c_ast.NodeVisitor):
-            def visit_FuncDecl(self, node):
-                name = FuncDecl_get_name(node)
-                try:    self.funcs[name].ast = node
-                except: log('Function not found in api.xml:', name)
-
-        FuncDefVisitor().visit(ast)
+            def visit_FuncDecl(_, node):
+                self.funcs[ FuncDecl_get_name(node) ].ast = node
+        FuncDefVisitor().visit(self.ast)
 
     def other_stuff(self):
-        # Step 4: Drop functions that don't have the 'ast' attribute
-        for name in list(funcs.keys()):
-            if funcs[name].ast is None:
-                funcs.pop(name)
-                log('Function not found in headers:', name)
+        self.funcs = list(self.funcs.values())
+
+        # Drop functions that don't have ast
+        self.missing_asts, self.funcs = partition(self.funcs, lambda f: not f.ast)
+
+        # Drop functions that don't have doc
+        self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
+
+        # Free() functions contain 'Free' and have 1 arg [of pointer type] .... TODO
+        self.free_funcs, self.funcs = partition(self.funcs,
+            lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
 
         # Step 5: ...
-        for f in funcs.values():
-            # Free() functions contain 'Free' and have 1 arg [of pointer type]
-            if 'Free' in f.doc.name and len(f.doc.args) == 1:
-                f.free = True
-
-            # Own functions return Ptr ... TODO 'not be freed'
+        for f in self.funcs:
+            # Own functions return Ptr ... TODO 'not be freed' + Ptr cannot be const!
             if contains(f.doc.returns.type, 'Ptr', '*') and (
                contains(f.doc.name, 'Create', 'New', 'Copy') or
                contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
@@ -324,7 +353,7 @@ class Converter():
 
             # TODO...
             if len(f.doc.args):
-                first_arg = meta.normalize_type(f.ast.args.params[0])
+                first_arg = self.meta.normalize_type(f.ast.args.params[0])
                 if type(first_arg.node) is c_ast.PtrDecl:
                     if type(first_arg.next.node) is c_ast.Struct:
                         f.this = 0
@@ -341,53 +370,56 @@ class Converter():
                     f.this = i
                     break
 
-        # We don't want to process free functions
-        for name in list(funcs.keys()):
-            if funcs[name].free:
-                funcs.pop(name)
-
-        # Collect all the ...
-        klasses = defaultdict(LibXML2_Class)
-        for f in funcs.values():
-            return_type = meta.normalize_type(f.ast.type)
-            return_type.clear_qualifiers()
-
+        # Bind functions to a class depending on return type / this parameter
+        klasses_ = defaultdict(LibXML2_Class)
+        for f in self.funcs:
             if f.this is None:
                 if f.own:
                     # No THIS but returns an owning ptr -> bind it to class of owning ptr
-                    klasses[return_type].functions.append(f)
-                    klasses[return_type].struct_type = return_type # TODO
+                    try:
+                        klasses_[AST_Find_Struct_Name(f.ast.type, self.meta)].functions.append(f)
+                    except:
+                        pass # TODO
             else:
-                this_arg_type = meta.normalize_type(f.ast.args.params[f.this])
-                this_arg_type.clear_qualifiers()
-                klasses[this_arg_type].functions.append(f)
-                klasses[this_arg_type].struct_type = this_arg_type # TODO
+                try:
+                    klasses_[AST_Find_Struct_Name(f.ast.args.params[f.this], self.meta)].functions.append(f)
+                except:
+                    pass #print(f.ast.args.params[f.this])
 
         # We're only interested in the values...
-        klasses = list(klasses.values())
-
-        # Collect all dependencies for the classes
-        for klass in klasses:
+        klasses = list()
+        for name, klass in klasses_.items():
+            klass.struct_type = name
             for function in klass.functions:
-                return_type = meta.normalize_type(function.ast.type)
-                return_type.clear_qualifiers()
-                klass.type_dependencies.add(return_type)
-                for argument in function.ast.args.params:
-                    arg_type = meta.normalize_type(argument)
-                    arg_type.clear_qualifiers()
-                    klass.type_dependencies.add(arg_type)
+                klass.type_dependencies |= AST_Find_All_Struct_Names(function.ast, self.meta)
+            klass.type_dependencies.discard(name)
+            klasses.append(klass)
+            #klass.type_dependencies.discard(AST_Find_All_Struct_Names(klass.struct_type, self.meta))
+        #for klass in klasses:
+        #    for function in klass.functions:
+        #        #return_type = self.meta.normalize_type(function.ast.type)
+        #        #return_type.clear_qualifiers()
+        #        return_type = find_struct(function.ast.type, self.meta)
+        #        klass.type_dependencies.add(return_type)
+        #        for argument in function.ast.args.params:
+        #            #arg_type = self.meta.normalize_type(argument)
+        #            #arg_type.clear_qualifiers()
+        #            arg_type = find_struct(argument, self.meta)
+        #            klass.type_dependencies.add(arg_type)
+
 
         # Blah
         klasses.sort(key=lambda k: len(k.type_dependencies))
 
         # DUMP
-        #for klass in klasses:
-        #    print(klass.struct_type)
-        #    for x in klass.type_dependencies: print(' ', x)
+        for klass in klasses:
+            print(klass.struct_type)
+            for x in klass.type_dependencies: print(' ', x)
+        #raise
 
         # Blooooh
         for e in klasses:
-            write_class(e, meta)
+            write_class(self, e)
 
 def functionName_to_methodName(f, struct_type):
     # xmlParserInputGrow, xmlParser
@@ -416,7 +448,7 @@ def functionName_to_methodName(f, struct_type):
     return f
     return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
 
-def write_class(klass, meta):
+def write_class(self, klass):
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
 
@@ -425,16 +457,23 @@ def write_class(klass, meta):
     for f in klass.functions:
         conditions[f.doc.cond].append(f)
 
-    print('class %s {' % StructType_to_class(klass.struct_type))
+    name = StructType_to_class(klass.struct_type)
+    print('template<int owns = 0>')
+    print('class %s {' % name)
+    print(' inline ~%s { if (own) free(cobj), cobj = NULL; }' % name)
+    print(' inline %s(c_ptr) : cobj(ptr) {}' % name)
+    print(' inline %s(%s<0> o) : cobj(o.cobj) {}' % (name, name))
+    print(' inline %s(%s<1> o) : cobj(o.cobj) { if (owns) {} }' % (name, name))
+    print(' inline %s<0> release() { }' % name) # TODO...
 
     # First, functions that have no preprocessor conditions
     for f in conditions.pop(None, []):
-        print(' ', write_method(f, klass.struct_type, meta))
+        print(' ', write_method(f, klass.struct_type, self.meta))
 
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
         print('#if', condition)
-        for f in functions: print(' ', write_method(f, klass.struct_type, meta))
+        for f in functions: print(' ', write_method(f, klass.struct_type, self.meta))
         print('#endif')
 
     print('};\n')
@@ -442,7 +481,8 @@ def write_class(klass, meta):
 def StructType_to_class(struct_type):
     # TODO.... eeerm .... idk 
     try:
-        name = struct_type.next.node.name
+        #name = struct_type.next.node.name
+        name = struct_type
         name = name.lstrip('_')
         name = re.sub('^(x|ht)ml', '', name)
         return name
@@ -459,7 +499,7 @@ def PtrType_to_class(ast, owns, meta):
     # TODO.... ach leck mich doch am arsch
     ast = deepcopy(ast)
     class ClearDeclname(c_ast.NodeVisitor):
-        def visit_TypeDecl(self, node):
+        def visit_TypeDecl(_, node):
             node.declname = ''
     ClearDeclname().visit(ast)
     name = ast_to_c(c_ast.Typename('', [], ast))
@@ -475,7 +515,9 @@ def write_method(function, struct_type, meta):
     s += '('
     s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
     s += ')'
-    s += ' { return '
+    s += ' { '
+    if function.doc.returns.type != 'void':
+        s += 'return '
     s += function.doc.name
     s += '('
     s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
