@@ -6,14 +6,16 @@ from collections import defaultdict
 from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
-# TODO: *EatName* functions
-# TODO: generate templated free-functions
-# TODO: generate copy/move constructors
-# TODO: don't bind on char*/void* 
-# TODO: sometimes structs/char* is reallocated! rebind cobj then!
-# TODO: constness on methods and return types
-# TODO: Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
-# TODO: Overloads: func(const char*) -> func(const char*), func(std::string)
+# TODO [x]: constness on methods and return types
+# TODO [ ]: also provide const methods for non-const....
+# TODO [ ]: *EatName* functions
+# TODO [ ]: generate templated free-functions
+# TODO [ ]: generate copy/move constructors
+# TODO [ ]: don't bind on char*/void* 
+# TODO [ ]: Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
+# TODO [ ]: Overloads: func(const char*) -> func(const char*), func(std::string)
+# TODO [ ]: sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
+# TODO [ ]: Error checking
 
 # =============================================================================
 # Util
@@ -172,6 +174,15 @@ def AST_Find_All_Struct_Names(ast, meta):
     v.visit(ast)
     return v.types
 
+def AST_Is_Ptr_To_Const(ast, meta):
+    # TODO: Maybe drop normalized?
+    normalized = meta.normalize_type(ast)
+    return type(normalized.node) is c_ast.PtrDecl and 'const' in normalized.next.quals
+
+def AST_Is_Ptr_To_Struct(ast, meta):
+    normalized = meta.normalize_type(ast)
+    return type(normalized.node) is c_ast.PtrDecl and type(normalized.next.node) is c_ast.Struct
+
 def AST_Find_Struct_Name(ast, meta):
     return AST_Find_All_Struct_Names(ast, meta).pop()
 
@@ -267,22 +278,6 @@ assert NormalizedIdentifier(['long',    'int'])  == NormalizedIdentifier(['long'
 assert NormalizedIdentifier(['signed'])          == NormalizedIdentifier(['int'])
 assert NormalizedIdentifier(['unsigned'])        == NormalizedIdentifier(['unsigned', 'int'])
 
-def FuncDecl_param_count(node):
-    return len(node.args.params)
-
-def Decl_type(node):
-    if type(node) == c_ast.PtrDecl:
-        return Decl_type(node.type) + '*'
-    elif type(node) == c_ast.TypeDecl:
-        return node.type.names[0]
-    else:
-        raise
-        return node
-        return "?"
-
-def Decl_name(node, default=None):
-    return node.name if node.name else default
-
 class Converter():
     def __init__(self, filename):
         self.filename     = filename
@@ -335,11 +330,14 @@ class Converter():
         # Drop functions that don't have doc
         self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
 
+        # XmlChar functions are an edge case, as they don't bind to a struct.
+        # Keeping them would increase the code generation complexity, so we drop them.
+        self.char_funcs, self.funcs = partition(self.funcs, lambda f: f.doc.module == 'xmlstring')
+
         # Free() functions contain 'Free' and have 1 arg [of pointer type] .... TODO
         self.free_funcs, self.funcs = partition(self.funcs,
             lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
 
-        # Step 5: ...
         for f in self.funcs:
             # Own functions return Ptr ... TODO 'not be freed' + Ptr cannot be const!
             if contains(f.doc.returns.type, 'Ptr', '*') and (
@@ -347,28 +345,17 @@ class Converter():
                contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
                 f.own = True
 
-            # First argument should be a this pointer....
-            #if len(f.doc.args) and contains(f.doc.args[0].type, 'Ptr', '*'):
-            #    f.this = 0
-
-            # TODO...
-            if len(f.doc.args):
-                first_arg = self.meta.normalize_type(f.ast.args.params[0])
-                if type(first_arg.node) is c_ast.PtrDecl:
-                    if type(first_arg.next.node) is c_ast.Struct:
-                        f.this = 0
-                    elif type(first_arg.next.node) is c_ast.IdentifierType:
-                        if NormalizedIdentifier(first_arg.next.node.names) == NormalizedIdentifier(['unsigned', 'char']):
-                            f.this = 0
-
-                #and type(normalize(f.ast.args.params[0], meta).node) is c_ast.PtrDecl:
-                #f.this = 0
-
-            # But 'cur' is better!
-            for i, arg in enumerate(f.doc.args):
-                if arg.name == 'cur':
+            # If we find a struct pointer named 'cur' use it as 'this' ...
+            for i, arg in enumerate(f.ast.args.params):
+                if AST_Is_Ptr_To_Struct(arg, self.meta) and arg.name == 'cur':
                     f.this = i
                     break
+
+            # ... else try to use the first arg as 'this' pointer
+            if f.this is None:
+                if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
+                    f.this = 0
+
 
         # Bind functions to a class depending on return type / this parameter
         klasses_ = defaultdict(LibXML2_Class)
@@ -508,13 +495,16 @@ def PtrType_to_class(ast, owns, meta):
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
     s  = 'inline '
-    if function.this is None: s += 'static '
+    if function.this is None:
+        s += 'static '
     s += PtrType_to_class(function.ast.type, function.own, meta)
     s += ' '
     s += functionName_to_methodName(function.doc.name, struct_type)
     s += '('
     s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
     s += ')'
+    if function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta):
+        s += ' const'
     s += ' { '
     if function.doc.returns.type != 'void':
         s += 'return '
