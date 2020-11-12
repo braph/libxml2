@@ -6,16 +6,17 @@ from collections import defaultdict
 from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
-# TODO [x]: constness on methods and return types
-# TODO [ ]: also provide const methods for non-const....
-# TODO [ ]: *EatName* functions
-# TODO [ ]: generate templated free-functions
-# TODO [ ]: generate copy/move constructors
-# TODO [ ]: don't bind on char*/void* 
-# TODO [ ]: Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
-# TODO [ ]: Overloads: func(const char*) -> func(const char*), func(std::string)
-# TODO [ ]: sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
-# TODO [ ]: Error checking
+# TODO:
+# [x] constness on methods and return types
+# [ ] also provide const methods for non-const....
+# [ ] *EatName* functions
+# [ ] generate templated free-functions
+# [ ] generate copy/move constructors
+# [ ] don't bind on char*/void* 
+# [ ] Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
+# [ ] Overloads: func(const char*) -> func(const char*), func(std::string)
+# [ ] sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
+# [ ] Error checking
 
 # =============================================================================
 # Util
@@ -24,17 +25,34 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 def log(*a, **kw):
     print(*a, **kw, file=sys.stderr)
 
-ast_to_c = c_generator.CGenerator().visit
-
 def contains(string, *search):
     for s in search:
         if s in string:
             return True
 
+def explode_title_case(string):
+    ''' 'FooBarBaz' -> ['Foo', 'Bar', 'Baz'] '''
+    part = ''
+    for c in string:
+        if c.isupper():
+            if part:
+                yield part
+            part = c
+        else:
+            part += c
+    if part:
+        yield part
+
+firstToLower = lambda s: s[0].lower() + s[1:]
+firstToUpper = lambda s: s[0].upper() + s[1:]
+
 def partition(iterable, predicate):
     r = ([],[])
-    for i in iterable: r[not bool(predicate(i))].append(i)
+    for i in iterable:
+        r[not bool(predicate(i))].append(i)
     return r
+
+ast_to_c = c_generator.CGenerator().visit
 
 # =============================================================================
 # LibXML2 API Documentation Data Classes
@@ -120,20 +138,20 @@ class Meta(c_ast.NodeVisitor):
 
     def normalize_type(self, node):
         ''' Strips of empty node types and resolves typedefs '''
-        return self.__normalize_type(node, Result(None, []), set()).next
+        return self._normalize_type(node, Result(None, []), set()).next
 
-    def __normalize_type(self, node, result, quals):
+    def _normalize_type(self, node, result, quals):
         T = type(node)
         if T is c_ast.Decl:
-            self.__normalize_type(node.type, result, quals)
+            self._normalize_type(node.type, result, quals)
         elif T in (c_ast.Typedef, c_ast.TypeDecl, c_ast.Typename):
-            self.__normalize_type(node.type, result, quals | set(node.quals))
+            self._normalize_type(node.type, result, quals | set(node.quals))
         elif T is c_ast.PtrDecl:
             result.next = Result(node, quals | set(node.quals))
-            self.__normalize_type(node.type, result.next, set())
+            self._normalize_type(node.type, result.next, set())
         elif T is c_ast.IdentifierType:
             n = self.resolve_identifier(node)
-            if n: self.__normalize_type(n, result, quals)
+            if n: self._normalize_type(n, result, quals)
             else: result.next = Result(node, quals)
         elif T in (c_ast.Struct, c_ast.Enum, c_ast.FuncDecl):
             result.next = Result(node, quals)
@@ -142,32 +160,6 @@ class Meta(c_ast.NodeVisitor):
         else:
             raise Exception(node)
         return result
-
-def AST_Find_All_Struct_Names(ast, meta):
-    class Visitor(c_ast.NodeVisitor):
-        def __init__(self):
-            self.types = set()
-        def visit_Struct(self, node):
-            self.types.add(node.name)
-        def visit_IdentifierType(self, node):
-            node = meta.resolve_identifier(node)
-            if node:
-                self.visit(node)
-    v = Visitor()
-    v.visit(ast)
-    return v.types
-
-def AST_Is_Ptr_To_Const(ast, meta):
-    # TODO: Maybe drop normalized?
-    normalized = meta.normalize_type(ast)
-    return type(normalized.node) is c_ast.PtrDecl and 'const' in normalized.next.quals
-
-def AST_Is_Ptr_To_Struct(ast, meta):
-    normalized = meta.normalize_type(ast)
-    return type(normalized.node) is c_ast.PtrDecl and type(normalized.next.node) is c_ast.Struct
-
-def AST_Find_Struct_Name(ast, meta):
-    return AST_Find_All_Struct_Names(ast, meta).pop()
 
 class Result(): # TODO rename
     def __init__(self, node, quals):
@@ -211,14 +203,6 @@ class Result(): # TODO rename
         # TODO: Include qualifiers in hash value
         return id(type(self.node)) + hash(self.next)
 
-
-def FuncDecl_get_name(node): # TODO: rename
-    T = type(node)
-    if   T is c_ast.TypeDecl: return node.declname
-    elif T is c_ast.FuncDecl: return FuncDecl_get_name(node.type)
-    elif T is c_ast.PtrDecl:  return FuncDecl_get_name(node.type)
-    raise
-
 class NormalizedIdentifier():
     __slots__ = ('signed', 'unsigned', 'char', 'short', 'long', 'int', 'float', 'double', 'void')
     def __init__(self, names):
@@ -261,6 +245,41 @@ assert NormalizedIdentifier(['long',    'int'])  == NormalizedIdentifier(['long'
 assert NormalizedIdentifier(['signed'])          == NormalizedIdentifier(['int'])
 assert NormalizedIdentifier(['unsigned'])        == NormalizedIdentifier(['unsigned', 'int'])
 
+def AST_Find_All_Struct_Names(ast, meta):
+    class Visitor(c_ast.NodeVisitor):
+        def __init__(self):
+            self.types = set()
+        def visit_Struct(self, node):
+            self.types.add(node.name)
+        def visit_IdentifierType(self, node):
+            node = meta.resolve_identifier(node)
+            if node:
+                self.visit(node)
+
+    v = Visitor()
+    v.visit(ast)
+    return v.types
+
+def AST_Find_Struct_Name(ast, meta):
+    return AST_Find_All_Struct_Names(ast, meta).pop()
+
+def AST_Is_Ptr_To_Const(ast, meta):
+    normalized = meta.normalize_type(ast)
+    return type(normalized.node) is c_ast.PtrDecl and 'const' in normalized.next.quals
+
+def AST_Is_Ptr_To_Struct(ast, meta):
+    normalized = meta.normalize_type(ast)
+    return type(normalized.node) is c_ast.PtrDecl and type(normalized.next.node) is c_ast.Struct
+
+def AST_Get_Declname(node):
+    T = type(node)
+    if   T is c_ast.TypeDecl: return node.declname
+    elif T is c_ast.FuncDecl: return AST_Get_Declname(node.type)
+    elif T is c_ast.PtrDecl:  return AST_Get_Declname(node.type)
+    raise
+
+# =============================================================================
+# Main code starts here...
 # =============================================================================
 
 class LibXML2_Function():
@@ -284,7 +303,6 @@ class Converter():
     def __init__(self, filename):
         self.filename     = filename
         self.funcs        = defaultdict(LibXML2_Function)
-        self.free_funcs   = {}
         self.api_xml_file = 'doc/libxml2-api.xml'
         self.ast          = None
         self.meta         = None
@@ -320,7 +338,7 @@ class Converter():
     def add_ast_to_functions(self):
         class FuncDefVisitor(c_ast.NodeVisitor):
             def visit_FuncDecl(_, node):
-                self.funcs[ FuncDecl_get_name(node) ].ast = node
+                self.funcs[AST_Get_Declname(node)].ast = node
         FuncDefVisitor().visit(self.ast)
 
     def other_stuff(self):
@@ -332,11 +350,12 @@ class Converter():
         # Drop functions that don't have doc
         self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
 
-        # XmlChar functions are an edge case, as they don't bind to a struct.
-        # Keeping them would increase the code generation complexity, so we drop them.
+        # Functions inside the 'xmlstring' module are an edge case.
+        # They are the only functions that don't operate on a pointer to struct.
+        # Keeping them would increase complexity of the code generation, so we drop them.
         self.char_funcs, self.funcs = partition(self.funcs, lambda f: f.doc.module == 'xmlstring')
 
-        # Free() functions contain 'Free' and have 1 arg [of pointer type] .... TODO
+        # Free() functions contain 'Free' and have one arg [of pointer type TODO?]
         self.free_funcs, self.funcs = partition(self.funcs,
             lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
 
@@ -376,7 +395,7 @@ class Converter():
                     pass #print(f.ast.args.params[f.this])
 
 
-        # We're only interested in the values...
+        # Add struct dependencies to klass
         klasses = list()
         for name, klass in klasses_.items():
             klass.struct_type = name
@@ -384,58 +403,27 @@ class Converter():
                 klass.type_dependencies |= AST_Find_All_Struct_Names(function.ast, self.meta)
             klass.type_dependencies.discard(name)
             klasses.append(klass)
-            #klass.type_dependencies.discard(AST_Find_All_Struct_Names(klass.struct_type, self.meta))
-        #for klass in klasses:
-        #    for function in klass.functions:
-        #        #return_type = self.meta.normalize_type(function.ast.type)
-        #        #return_type.clear_qualifiers()
-        #        return_type = find_struct(function.ast.type, self.meta)
-        #        klass.type_dependencies.add(return_type)
-        #        for argument in function.ast.args.params:
-        #            #arg_type = self.meta.normalize_type(argument)
-        #            #arg_type.clear_qualifiers()
-        #            arg_type = find_struct(argument, self.meta)
-        #            klass.type_dependencies.add(arg_type)
-
 
         # Blah
         klasses.sort(key=lambda k: len(k.type_dependencies))
 
-        # DUMP
-        for klass in klasses:
-            print(klass.struct_type)
-            for x in klass.type_dependencies: print(' ', x)
-        #raise
+        #for k in klasses: print(k.struct_type, k.type_dependencies)
 
         for e in klasses:
             write_class(self, e)
 
+def strip_xml_prefix(string):
+    return re.sub('^(x|ht)ml', '', string.lstrip('_'))
+
 def functionName_to_methodName(f, struct_type):
-    # xmlParserInputGrow, xmlParser
-    # TODO....
+    f = strip_xml_prefix(f)
+    struct_type = strip_xml_prefix(struct_type)
 
-    try: struct_type = struct_type.next.node.name
-    except: pass
+    for part in explode_title_case(struct_type):
+        if f.startswith(part) and f[len(part)].isupper():
+            f = f[len(part):]
 
-    f = re.sub('^_?(x|ht)ml', '', f) # 
-    if type(struct_type) is str:
-        struct_type = re.sub('^_?(x|ht)ml', '', struct_type)
-
-        # TODO: common prefix only on camel case...
-        common_prefix_len = 0
-        for c1, c2 in zip(f, struct_type):
-            if c1 != c2: break
-            common_prefix_len += 1
-
-        if common_prefix_len < 2:
-            common_prefix_len = 0
-
-        #print('<<<<<<<<<<<', f, struct_type, common_prefix)
-
-        return f[common_prefix_len:]
-
-    return f
-    return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
+    return firstToLower(f)
 
 def write_class(self, klass):
     # Sort alphabetically by function name
@@ -446,9 +434,11 @@ def write_class(self, klass):
     for f in klass.functions:
         conditions[f.doc.cond].append(f)
 
-    name = StructType_to_class(klass.struct_type)
+    name = firstToUpper(strip_xml_prefix(klass.struct_type))
     print('template<int owns = 0>')
     print('class %s {' % name)
+    print(' %s* cobj;' % klass.struct_type)
+    print('public:')
     print(' inline ~%s { if (own) free(cobj), cobj = NULL; }' % name)
     print(' inline %s(c_ptr) : cobj(ptr) {}' % name)
     print(' inline %s(%s<0> o) : cobj(o.cobj) {}' % (name, name))
@@ -467,39 +457,27 @@ def write_class(self, klass):
 
     print('};\n')
 
-def StructType_to_class(struct_type):
-    # TODO.... eeerm .... idk 
-    try:
-        #name = struct_type.next.node.name
-        name = struct_type
-        name = name.lstrip('_')
-        name = re.sub('^(x|ht)ml', '', name)
-        return name
-    except:
-        return struct_type
-
-def PtrType_to_class(ast, owns, meta):
+def make_return_type(ast, owns, meta):
     normalized = meta.normalize_type(ast)
     if type(normalized.node) == c_ast.PtrDecl:
-        if type(normalized.next.node) == c_ast.Struct: # TODO: or identifier.
+        if type(normalized.next.node) == c_ast.Struct:
             name = '%s<%d>' %(normalized.next.node.name, bool(owns))
-            return re.sub('^_?(x|ht)ml', '', name).replace('Ptr','')
+            return strip_xml_prefix(name)
 
-    # TODO.... ach leck mich doch am arsch
     ast = deepcopy(ast)
     class ClearDeclname(c_ast.NodeVisitor):
         def visit_TypeDecl(_, node):
             node.declname = ''
     ClearDeclname().visit(ast)
     name = ast_to_c(c_ast.Typename('', [], ast))
-    return re.sub('^_?(x|ht)ml', '', name).replace('Ptr','')
+    return strip_xml_prefix(name).replace('Ptr','')
 
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
     s  = 'inline '
     if function.this is None:
         s += 'static '
-    s += PtrType_to_class(function.ast.type, function.own, meta)
+    s += make_return_type(function.ast.type, function.own, meta)
     s += ' '
     s += functionName_to_methodName(function.doc.name, struct_type)
     s += '('
