@@ -12,7 +12,6 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 # [ ] *EatName* functions
 # [ ] generate templated free-functions
 # [ ] generate copy/move constructors
-# [ ] don't bind on char*/void* 
 # [ ] Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
 # [ ] Overloads: func(const char*) -> func(const char*), func(std::string)
 # [ ] sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
@@ -25,13 +24,19 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 def log(*a, **kw):
     print(*a, **kw, file=sys.stderr)
 
+def partition(iterable, predicate):
+    r = ([],[])
+    for i in iterable:
+        r[not bool(predicate(i))].append(i)
+    return r
+
 def contains(string, *search):
     for s in search:
         if s in string:
             return True
 
-def explode_title_case(string):
-    ''' 'FooBarBaz' -> ['Foo', 'Bar', 'Baz'] '''
+def split_title_case(string):
+    ''' 'fooBarBaz' -> ['foo', 'Bar', 'Baz'] '''
     part = ''
     for c in string:
         if c.isupper():
@@ -45,12 +50,6 @@ def explode_title_case(string):
 
 firstToLower = lambda s: s[0].lower() + s[1:]
 firstToUpper = lambda s: s[0].upper() + s[1:]
-
-def partition(iterable, predicate):
-    r = ([],[])
-    for i in iterable:
-        r[not bool(predicate(i))].append(i)
-    return r
 
 ast_to_c = c_generator.CGenerator().visit
 
@@ -419,7 +418,7 @@ def functionName_to_methodName(f, struct_type):
     f = strip_xml_prefix(f)
     struct_type = strip_xml_prefix(struct_type)
 
-    for part in explode_title_case(struct_type):
+    for part in split_title_case(struct_type):
         if f.startswith(part) and f[len(part)].isupper():
             f = f[len(part):]
 
