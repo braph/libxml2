@@ -2,6 +2,7 @@
 
 import sys, re
 from copy        import deepcopy
+from tempfile    import NamedTemporaryFile
 from collections import defaultdict
 from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
@@ -15,10 +16,238 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 # [ ] Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
 # [ ] Overloads: func(const char*) -> func(const char*), func(std::string)
 # [ ] sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
+# [ ] sometimes char* is reallocated but only if it differs!
 # [ ] Error checking
+# [ ] va_args handling?
 
 # =============================================================================
-# Util
+# Main code ===================================================================
+# =============================================================================
+
+class LibXML2_Function():
+    ''' Data class that ties all available information about a function together '''
+
+    __slots__ = ('doc', 'ast', 'own', 'this')
+    def __init__(self, **kw):
+        for s in self.__slots__: setattr(self, s, kw.get(s, None))
+
+    def __repr__(self):
+        return repr(self.doc)
+
+class LibXML2_Class():
+    __slots__ = ('struct_type', 'functions', 'type_dependencies')
+    def __init__(self, struct_type=None):
+        self.struct_type        = struct_type
+        self.functions          = []
+        self.type_dependencies  = set()
+
+class Converter():
+    def __init__(self):
+        self.api_xml_file = 'doc/libxml2-api.xml'
+        self.header_files = []
+        self.funcs        = defaultdict(LibXML2_Function)
+        self.ast          = None
+        self.meta         = None
+
+    def run(self):
+        self.read_api_xml()
+        self.parse_header_files()
+        self.add_ast_to_functions()
+        self.other_stuff()
+
+    def read_api_xml(self):
+        for section in etree.parse(self.api_xml_file).getroot():
+            if section.tag == 'symbols':
+                for symbol in section:
+                    if symbol.tag == 'function':
+                        self.funcs[symbol.attrib['name']].doc = API_Doc_Function.from_xmlnode(symbol)
+            elif section.tag == 'files':
+                for file in section:
+                    self.header_files.append(file.attrib['name'])
+
+    def parse_header_files(self):
+        fh = NamedTemporaryFile('w', prefix='libxml-cpp', suffix='.h')
+
+        for f in self.header_files:
+            fh.write('#include <libxml/%s.h>\n' % f)
+        fh.flush()
+
+        self.ast = parse_file(fh.name, use_cpp=True,
+            cpp_path='gcc',
+            cpp_args=[
+            '-E',
+            '-D__attribute__(x)=',
+            '-I.',
+            '-Ifake_libc_include',
+            '-I/usr/include/libxml2',
+            # '-nostdinc', '-undef', '-I/usr/include',
+        ])
+
+        self.meta = Meta(self.ast)
+
+    def add_ast_to_functions(self):
+        class FuncDefVisitor(c_ast.NodeVisitor):
+            def visit_FuncDecl(_, node):
+                self.funcs[AST_Get_Declname(node)].ast = node
+        FuncDefVisitor().visit(self.ast)
+
+    def other_stuff(self):
+        self.funcs = list(self.funcs.values())
+
+        # Drop functions that don't have ast
+        self.missing_asts, self.funcs = partition(self.funcs, lambda f: not f.ast)
+
+        # Drop functions that don't have doc
+        self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
+
+        # Functions inside the 'xmlstring' module are an edge case.
+        # They are the only functions that don't operate on a pointer to struct.
+        # Keeping them would increase complexity of the code generation, so we drop them.
+        self.char_funcs, self.funcs = partition(self.funcs, lambda f: f.doc.module == 'xmlstring')
+
+        # Free() functions contain 'Free' and have one arg
+        self.free_funcs, self.funcs = partition(self.funcs,
+            lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
+
+        for f in self.funcs:
+            # Own functions return Ptr
+            if AST_Is_Ptr_To_NonConst(f.ast.type, self.meta) and (
+               contains(f.doc.name, 'Create', 'New', 'Copy') or
+               contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
+                f.own = True
+
+            # If we find a struct pointer named 'cur' use it as 'this' ...
+            for i, arg in enumerate(f.ast.args.params):
+                if AST_Is_Ptr_To_Struct(arg, self.meta) and arg.name == 'cur':
+                    f.this = i
+                    break
+
+            # ... else try to use the first arg as 'this' pointer
+            if f.this is None:
+                if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
+                    f.this = 0
+
+
+        # Bind functions to a class depending on return type / this parameter
+        klasses_ = defaultdict(LibXML2_Class)
+        for f in self.funcs:
+            if f.this is None:
+                if f.own:
+                    # No THIS but returns an owning ptr -> bind it to class of owning ptr
+                    try:
+                        klasses_[AST_Find_Struct_Name(f.ast.type, self.meta)].functions.append(f)
+                    except:
+                        #raise Exception(f.ast)
+                        pass # TODO
+            else:
+                try:
+                    klasses_[AST_Find_Struct_Name(f.ast.args.params[f.this], self.meta)].functions.append(f)
+                except:
+                    pass #print(f.ast.args.params[f.this])
+
+
+        # Add struct dependencies to klass
+        klasses = list()
+        for name, klass in klasses_.items():
+            klass.struct_type = name
+            for function in klass.functions:
+                klass.type_dependencies |= AST_Find_All_Struct_Names(function.ast, self.meta)
+            klass.type_dependencies.discard(name)
+            klasses.append(klass)
+
+        # Blah
+        klasses.sort(key=lambda k: len(k.type_dependencies))
+
+        #for k in klasses: print(k.struct_type, k.type_dependencies)
+
+        for e in klasses:
+            write_class(self, e)
+
+def strip_xml_prefix(string):
+    return re.sub('^(x|ht)ml', '', string.lstrip('_'))
+
+def functionName_to_methodName(f, struct_type):
+    f = strip_xml_prefix(f)
+    struct_type = strip_xml_prefix(struct_type)
+
+    for part in split_title_case(struct_type):
+        if f.startswith(part) and f[len(part)].isupper():
+            f = f[len(part):]
+
+    return firstToLower(f)
+
+def write_class(self, klass):
+    # Sort alphabetically by function name
+    klass.functions.sort(key=lambda f: f.doc.name)
+
+    # Group functions by preprocessor conditions
+    conditions = defaultdict(list)
+    for f in klass.functions:
+        conditions[f.doc.cond].append(f)
+
+    name = firstToUpper(strip_xml_prefix(klass.struct_type))
+    print('template<int owns = 0>')
+    print('class %s {' % name)
+    print(' %s* cobj;' % klass.struct_type)
+    print('public:')
+    print(' inline ~%s { if (own) free(cobj), cobj = NULL; }' % name)
+    print(' inline %s(c_ptr) : cobj(ptr) {}' % name)
+    print(' inline %s(%s<0> o) : cobj(o.cobj) {}' % (name, name))
+    print(' inline %s(%s<1> o) : cobj(o.cobj) { if (owns) {} }' % (name, name))
+    print(' inline %s<0> release() { }' % name) # TODO...
+
+    # First, functions that have no preprocessor conditions
+    for f in conditions.pop(None, []):
+        print(' ', write_method(f, klass.struct_type, self.meta))
+
+    # Second, functions that have preprocessor conditions
+    for condition, functions in conditions.items():
+        print('#if', condition)
+        for f in functions: print(' ', write_method(f, klass.struct_type, self.meta))
+        print('#endif')
+
+    print('};\n')
+
+def make_return_type(ast, owns, meta):
+    normalized = meta.normalize_type(ast)
+    if type(normalized.node) == c_ast.PtrDecl:
+        if type(normalized.next.node) == c_ast.Struct:
+            name = strip_xml_prefix(normalized.next.node.name)
+            return '%s<%d>' % (name, bool(owns))
+
+    ast = deepcopy(ast)
+    class ClearDeclname(c_ast.NodeVisitor):
+        def visit_TypeDecl(_, node):
+            node.declname = ''
+    ClearDeclname().visit(ast)
+    name = ast_to_c(c_ast.Typename('', [], ast))
+    return strip_xml_prefix(name).replace('Ptr','')
+
+def write_method(function, struct_type, meta):
+    ''' Generate the code for a wrapped function '''
+    s  = 'inline '
+    if function.this is None:
+        s += 'static '
+    s += make_return_type(function.ast.type, function.own, meta)
+    s += ' '
+    s += functionName_to_methodName(function.doc.name, struct_type)
+    s += '('
+    s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
+    s += ')'
+    if function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta):
+        s += ' const'
+    s += ' { '
+    if function.doc.returns.type != 'void':
+        s += 'return '
+    s += function.doc.name
+    s += '('
+    s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
+    s += '); '
+    s += '}'
+    return s
+
+# =============================================================================
+# Util ========================================================================
 # =============================================================================
 
 def log(*a, **kw):
@@ -54,7 +283,7 @@ firstToUpper = lambda s: s[0].upper() + s[1:]
 ast_to_c = c_generator.CGenerator().visit
 
 # =============================================================================
-# LibXML2 API Documentation Data Classes
+# LibXML2 API Documentation Data Classes ======================================
 # =============================================================================
 
 class API_Doc_Function():
@@ -113,7 +342,7 @@ class API_Doc_Return():
             info=node.attrib.get('info',''))
 
 # =============================================================================
-# AST Stuff
+# AST Stuff ===================================================================
 # =============================================================================
 
 class Meta(c_ast.NodeVisitor):
@@ -262,14 +491,6 @@ def AST_Find_All_Struct_Names(ast, meta):
 def AST_Find_Struct_Name(ast, meta):
     return AST_Find_All_Struct_Names(ast, meta).pop()
 
-def AST_Is_Ptr_To_Const(ast, meta):
-    normalized = meta.normalize_type(ast)
-    return type(normalized.node) is c_ast.PtrDecl and 'const' in normalized.next.quals
-
-def AST_Is_Ptr_To_Struct(ast, meta):
-    normalized = meta.normalize_type(ast)
-    return type(normalized.node) is c_ast.PtrDecl and type(normalized.next.node) is c_ast.Struct
-
 def AST_Get_Declname(node):
     T = type(node)
     if   T is c_ast.TypeDecl: return node.declname
@@ -277,224 +498,19 @@ def AST_Get_Declname(node):
     elif T is c_ast.PtrDecl:  return AST_Get_Declname(node.type)
     raise
 
-# =============================================================================
-# Main code starts here...
-# =============================================================================
+def AST_Is_Ptr_To_Const(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.PtrDecl and 'const' in norm.next.quals
 
-class LibXML2_Function():
-    ''' Data class that ties all available information about a function together '''
+def AST_Is_Ptr_To_NonConst(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.PtrDecl and 'const' not in norm.next.quals
 
-    __slots__ = ('doc', 'ast', 'own', 'this')
-    def __init__(self, **kw):
-        for s in self.__slots__: setattr(self, s, kw.get(s, None))
+def AST_Is_Ptr_To_Struct(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.PtrDecl and type(norm.next.node) is c_ast.Struct
 
-    def __repr__(self):
-        return repr(self.doc)
-
-class LibXML2_Class():
-    __slots__ = ('struct_type', 'functions', 'type_dependencies')
-    def __init__(self, struct_type=None):
-        self.struct_type        = struct_type
-        self.functions          = []
-        self.type_dependencies  = set()
-
-class Converter():
-    def __init__(self, filename):
-        self.filename     = filename
-        self.funcs        = defaultdict(LibXML2_Function)
-        self.api_xml_file = 'doc/libxml2-api.xml'
-        self.ast          = None
-        self.meta         = None
-
-    def run(self):
-        self.collect_api_documentation()
-        self.parse_header_files()
-        self.add_ast_to_functions()
-        self.other_stuff()
-
-    def collect_api_documentation(self):
-        for section in etree.parse(self.api_xml_file).getroot():
-            if section.tag == 'symbols':
-                for symbol in section:
-                    if symbol.tag == 'function':
-                        self.funcs[symbol.attrib['name']].doc = API_Doc_Function.from_xmlnode(symbol)
-                        #print(self.funcs[symbol.attrib['name']].doc) TODO
-
-    def parse_header_files(self):
-        self.ast = parse_file(self.filename, use_cpp=True,
-            cpp_path='gcc',
-            cpp_args=[
-            '-E',
-            '-D__attribute__(x)=',
-            '-I.',
-            '-Ifake_libc_include',
-            '-I/usr/include/libxml2',
-            # '-nostdinc', '-undef', '-I/usr/include',
-        ])
-
-        self.meta = Meta(self.ast)
-
-    def add_ast_to_functions(self):
-        class FuncDefVisitor(c_ast.NodeVisitor):
-            def visit_FuncDecl(_, node):
-                self.funcs[AST_Get_Declname(node)].ast = node
-        FuncDefVisitor().visit(self.ast)
-
-    def other_stuff(self):
-        self.funcs = list(self.funcs.values())
-
-        # Drop functions that don't have ast
-        self.missing_asts, self.funcs = partition(self.funcs, lambda f: not f.ast)
-
-        # Drop functions that don't have doc
-        self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
-
-        # Functions inside the 'xmlstring' module are an edge case.
-        # They are the only functions that don't operate on a pointer to struct.
-        # Keeping them would increase complexity of the code generation, so we drop them.
-        self.char_funcs, self.funcs = partition(self.funcs, lambda f: f.doc.module == 'xmlstring')
-
-        # Free() functions contain 'Free' and have one arg [of pointer type TODO?]
-        self.free_funcs, self.funcs = partition(self.funcs,
-            lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
-
-        for f in self.funcs:
-            # Own functions return Ptr ... TODO 'not be freed' + Ptr cannot be const!
-            if contains(f.doc.returns.type, 'Ptr', '*') and (
-               contains(f.doc.name, 'Create', 'New', 'Copy') or
-               contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
-                f.own = True
-
-            # If we find a struct pointer named 'cur' use it as 'this' ...
-            for i, arg in enumerate(f.ast.args.params):
-                if AST_Is_Ptr_To_Struct(arg, self.meta) and arg.name == 'cur':
-                    f.this = i
-                    break
-
-            # ... else try to use the first arg as 'this' pointer
-            if f.this is None:
-                if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
-                    f.this = 0
-
-
-        # Bind functions to a class depending on return type / this parameter
-        klasses_ = defaultdict(LibXML2_Class)
-        for f in self.funcs:
-            if f.this is None:
-                if f.own:
-                    # No THIS but returns an owning ptr -> bind it to class of owning ptr
-                    try:
-                        klasses_[AST_Find_Struct_Name(f.ast.type, self.meta)].functions.append(f)
-                    except:
-                        pass # TODO
-            else:
-                try:
-                    klasses_[AST_Find_Struct_Name(f.ast.args.params[f.this], self.meta)].functions.append(f)
-                except:
-                    pass #print(f.ast.args.params[f.this])
-
-
-        # Add struct dependencies to klass
-        klasses = list()
-        for name, klass in klasses_.items():
-            klass.struct_type = name
-            for function in klass.functions:
-                klass.type_dependencies |= AST_Find_All_Struct_Names(function.ast, self.meta)
-            klass.type_dependencies.discard(name)
-            klasses.append(klass)
-
-        # Blah
-        klasses.sort(key=lambda k: len(k.type_dependencies))
-
-        #for k in klasses: print(k.struct_type, k.type_dependencies)
-
-        for e in klasses:
-            write_class(self, e)
-
-def strip_xml_prefix(string):
-    return re.sub('^(x|ht)ml', '', string.lstrip('_'))
-
-def functionName_to_methodName(f, struct_type):
-    f = strip_xml_prefix(f)
-    struct_type = strip_xml_prefix(struct_type)
-
-    for part in split_title_case(struct_type):
-        if f.startswith(part) and f[len(part)].isupper():
-            f = f[len(part):]
-
-    return firstToLower(f)
-
-def write_class(self, klass):
-    # Sort alphabetically by function name
-    klass.functions.sort(key=lambda f: f.doc.name)
-
-    # Group functions by preprocessor conditions
-    conditions = defaultdict(list)
-    for f in klass.functions:
-        conditions[f.doc.cond].append(f)
-
-    name = firstToUpper(strip_xml_prefix(klass.struct_type))
-    print('template<int owns = 0>')
-    print('class %s {' % name)
-    print(' %s* cobj;' % klass.struct_type)
-    print('public:')
-    print(' inline ~%s { if (own) free(cobj), cobj = NULL; }' % name)
-    print(' inline %s(c_ptr) : cobj(ptr) {}' % name)
-    print(' inline %s(%s<0> o) : cobj(o.cobj) {}' % (name, name))
-    print(' inline %s(%s<1> o) : cobj(o.cobj) { if (owns) {} }' % (name, name))
-    print(' inline %s<0> release() { }' % name) # TODO...
-
-    # First, functions that have no preprocessor conditions
-    for f in conditions.pop(None, []):
-        print(' ', write_method(f, klass.struct_type, self.meta))
-
-    # Second, functions that have preprocessor conditions
-    for condition, functions in conditions.items():
-        print('#if', condition)
-        for f in functions: print(' ', write_method(f, klass.struct_type, self.meta))
-        print('#endif')
-
-    print('};\n')
-
-def make_return_type(ast, owns, meta):
-    normalized = meta.normalize_type(ast)
-    if type(normalized.node) == c_ast.PtrDecl:
-        if type(normalized.next.node) == c_ast.Struct:
-            name = '%s<%d>' %(normalized.next.node.name, bool(owns))
-            return strip_xml_prefix(name)
-
-    ast = deepcopy(ast)
-    class ClearDeclname(c_ast.NodeVisitor):
-        def visit_TypeDecl(_, node):
-            node.declname = ''
-    ClearDeclname().visit(ast)
-    name = ast_to_c(c_ast.Typename('', [], ast))
-    return strip_xml_prefix(name).replace('Ptr','')
-
-def write_method(function, struct_type, meta):
-    ''' Generate the code for a wrapped function '''
-    s  = 'inline '
-    if function.this is None:
-        s += 'static '
-    s += make_return_type(function.ast.type, function.own, meta)
-    s += ' '
-    s += functionName_to_methodName(function.doc.name, struct_type)
-    s += '('
-    s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
-    s += ')'
-    if function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta):
-        s += ' const'
-    s += ' { '
-    if function.doc.returns.type != 'void':
-        s += 'return '
-    s += function.doc.name
-    s += '('
-    s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
-    s += '); '
-    s += '}'
-    return s
 
 if __name__ == "__main__":
     # ./doc/apibuild.py
-    for filename in sys.argv[1:]:
-        Converter(filename).run()
+    Converter().run()
