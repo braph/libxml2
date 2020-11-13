@@ -8,17 +8,25 @@ from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
-# [x] constness on methods and return types
-# [ ] also provide const methods for non-const....
-# [ ] *EatName* functions
-# [ ] generate templated free-functions
-# [ ] generate copy/move constructors
-# [ ] Overloads: func1(arg1), func2(arg1, arg2) -> func(arg1), func(arg1, arg2)
-# [ ] Overloads: func(const char*) -> func(const char*), func(std::string)
-# [ ] sometimes structs/char* is reallocated! rebind cobj then! (it seems that this only applies to char*?!)
-# [ ] sometimes char* is reallocated but only if it differs!
-# [ ] Error checking
-# [ ] va_args handling?
+# [x] Make class methods 'const' based on constness of 'this' pointer
+# [ ] Generate classes for ALL(!) structs
+# [ ] operator ptr_type()
+# [ ] Also provide 'const' methods for methods that are NOT const
+# [ ] Methods matching *EatName* should unown the passed argument
+# [ ] In class destructors: Use matching free-function based on 'this' type instead of free()
+# [ ] Generate copy/move constructors
+# [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
+# [ ] Overload: func(const char*) -> func(const char*), func(std::string)
+# [ ] Sometimes struct*/char* is reallocated! rebind cobj then!
+#     examples: xmlStrcat(), xmlXPathConvertBoolean()
+# [ ] Sometimes char* is reallocated but only if the returned pointer differs from original 'this' -> REBIND!
+#     examples: xmlBuildQName
+# [ ] Error checking based on the function documentation
+# [ ] Add 'noexcept' specifier on methods that don't report errors
+# [ ] Wrap va_args functions using variadic template methods
+# [ ] Enums: Rename them and put them into namespace (enum xmlStatus -> Xml::enum Status)
+# [ ] Meta::normalize_type should be memoized, since it's called very often
+# [ ] Add Iterators for children of Nodes
 
 # =============================================================================
 # Main code ===================================================================
@@ -111,9 +119,7 @@ class Converter():
 
         for f in self.funcs:
             # Own functions return Ptr
-            if AST_Is_Ptr_To_NonConst(f.ast.type, self.meta) and (
-               contains(f.doc.name, 'Create', 'New', 'Copy') or
-               contains(f.doc.returns.info, 'newly created', 'a new', 'the new', 'the resulting document tree')):
+            if Function_Returns_Owning(f, self.meta):
                 f.own = True
 
             # If we find a struct pointer named 'cur' use it as 'this' ...
@@ -126,7 +132,6 @@ class Converter():
             if f.this is None:
                 if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
                     f.this = 0
-
 
         # Bind functions to a class depending on return type / this parameter
         klasses_ = defaultdict(LibXML2_Class)
@@ -145,7 +150,6 @@ class Converter():
                 except:
                     pass #print(f.ast.args.params[f.this])
 
-
         # Add struct dependencies to klass
         klasses = list()
         for name, klass in klasses_.items():
@@ -158,10 +162,41 @@ class Converter():
         # Blah
         klasses.sort(key=lambda k: len(k.type_dependencies))
 
+        # TODO: Hack
+        klasses.append(LibXML2_Class('_xmlAutomataState'))
+        klasses.append(LibXML2_Class('_xmlAttribute'))
+        klasses.append(LibXML2_Class('_xmlElement'))
+        klasses.append(LibXML2_Class('_xmlNotation'))
+        klasses.append(LibXML2_Class('_xmlEntity'))
+        klasses.append(LibXML2_Class('_xmlParserNodeInfo'))
+        klasses.append(LibXML2_Class('_xmlID'))
+        klasses.append(LibXML2_Class('_xmlRef'))
+
         #for k in klasses: print(k.struct_type, k.type_dependencies)
 
-        for e in klasses:
-            write_class(self, e)
+        for f in self.header_files:
+            print('#include <libxml/%s.h>' % f)
+
+        print('namespace Xml {')
+
+        for klass in klasses:
+            print('template<bool> class %s;' % firstToUpper(strip_xml_prefix(klass.struct_type)))
+
+        for klass in klasses:
+            write_class(self, klass)
+
+        print('}')
+
+def Function_Returns_Owning(f, meta):
+    return AST_Is_Ptr_To_NonConst(f.ast.type, meta) and (
+        contains(f.doc.name, 'Create', 'New', 'Copy') or
+        contains(f.doc.returns.info,
+            'newly created',
+            'a new',
+            'the new',
+            'the resulting document tree',
+            'the caller has to free the object'
+            ))
 
 def strip_xml_prefix(string):
     return re.sub('^(x|ht)ml', '', string.lstrip('_'))
@@ -174,31 +209,35 @@ def functionName_to_methodName(f, struct_type):
         if f.startswith(part) and f[len(part)].isupper():
             f = f[len(part):]
 
-    return firstToLower(f)
+    f = firstToLower(f)
+    if f == 'delete': return 'Delete' # TODO!
+    return f
 
 def write_class(self, klass):
+    name = firstToUpper(strip_xml_prefix(klass.struct_type))
+    print('template<bool Owning = 0>')
+    print('class %s {' % name)
+    print(' %s *cobj;' % klass.struct_type)
+    print('public:')
+    print(' inline ~%s() { if (Owning) free(cobj), cobj = NULL; }' % name)
+    print(' inline %s(%s *ptr) : cobj(ptr) {}' % (name, klass.struct_type))
+    print(' inline %s(const %s<0> &o) : cobj(o.cobj) {}' % (name, name))
+    print(' inline %s(const %s<1> &o) : cobj(o.cobj) { if (Owning) {} }' % (name, name))
+    print(' inline operator %s*() { return cobj; }' % klass.struct_type)
+    print(' inline %s<0> release() { }' % name) # TODO...
+
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
 
     # Group functions by preprocessor conditions
     conditions = defaultdict(list)
     for f in klass.functions:
+        if not re.match('^xml', f.doc.name): continue # TODO: RM
         conditions[f.doc.cond].append(f)
-
-    name = firstToUpper(strip_xml_prefix(klass.struct_type))
-    print('template<int owns = 0>')
-    print('class %s {' % name)
-    print(' %s* cobj;' % klass.struct_type)
-    print('public:')
-    print(' inline ~%s { if (own) free(cobj), cobj = NULL; }' % name)
-    print(' inline %s(c_ptr) : cobj(ptr) {}' % name)
-    print(' inline %s(%s<0> o) : cobj(o.cobj) {}' % (name, name))
-    print(' inline %s(%s<1> o) : cobj(o.cobj) { if (owns) {} }' % (name, name))
-    print(' inline %s<0> release() { }' % name) # TODO...
 
     # First, functions that have no preprocessor conditions
     for f in conditions.pop(None, []):
-        print(' ', write_method(f, klass.struct_type, self.meta))
+        print(' '+ write_method(f, klass.struct_type, self.meta))
 
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
@@ -213,7 +252,20 @@ def make_return_type(ast, owns, meta):
     if type(normalized.node) == c_ast.PtrDecl:
         if type(normalized.next.node) == c_ast.Struct:
             name = strip_xml_prefix(normalized.next.node.name)
-            return '%s<%d>' % (name, bool(owns))
+            return '%s<%d-Owning*0>' % (name, bool(owns))
+
+        if type(normalized.next.node) == c_ast.FuncDecl:
+            return normalized.next.node.type.declname # TODO!!!!
+
+    if AST_Is_Enum(ast, meta):
+        # TODO: move enum to Xml:: and strip off Xml-Preifx
+        return ast.type.names[0] # TODO: handle this better
+
+    if AST_Is_Ptr_To_Unsigned_Char(ast, meta):
+        return 'xmlChar* ' # TODO: handle const
+
+    if type(normalized.node) is c_ast.IdentifierType and normalized.node.names == ['unsigned','char']:
+        return 'xmlChar ' # TODO!!!!!!
 
     ast = deepcopy(ast)
     class ClearDeclname(c_ast.NodeVisitor):
@@ -221,10 +273,16 @@ def make_return_type(ast, owns, meta):
             node.declname = ''
     ClearDeclname().visit(ast)
     name = ast_to_c(c_ast.Typename('', [], ast))
-    return strip_xml_prefix(name).replace('Ptr','')
+    return name
+    return strip_xml_prefix(name).replace('Ptr','') # TODO: replace(Ptr) needed?! this line needed?
 
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
+
+    for arg in function.ast.args.params:
+        if type(arg) is c_ast.EllipsisParam:
+            return '' # TODO: This skips ...
+
     s  = 'inline '
     if function.this is None:
         s += 'static '
@@ -488,7 +546,11 @@ def AST_Find_All_Struct_Names(ast, meta):
     v.visit(ast)
     return v.types
 
-def AST_Find_Struct_Name(ast, meta):
+def AST_Find_Struct_Name(ast, meta): # TODO: rename this and exception blubber
+    norm = meta.normalize_type(ast)
+    if type(norm.node) is c_ast.PtrDecl and type(norm.next.node) is c_ast.Struct:
+        return norm.next.node.name
+    raise Exception()
     return AST_Find_All_Struct_Names(ast, meta).pop()
 
 def AST_Get_Declname(node):
@@ -497,6 +559,16 @@ def AST_Get_Declname(node):
     elif T is c_ast.FuncDecl: return AST_Get_Declname(node.type)
     elif T is c_ast.PtrDecl:  return AST_Get_Declname(node.type)
     raise
+
+def AST_Is_Enum(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.Enum
+
+def AST_Is_Ptr_To_Unsigned_Char(ast, meta):
+    norm = meta.normalize_type(ast) # TODO NormalizedIdentifier
+    return type(norm.node) is c_ast.PtrDecl and \
+           type(norm.next.node) is c_ast.IdentifierType and \
+           norm.next.node.names == ['unsigned', 'char']
 
 def AST_Is_Ptr_To_Const(ast, meta):
     norm = meta.normalize_type(ast)
