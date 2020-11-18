@@ -9,19 +9,20 @@ from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
+# [ ] Also provide 'const' methods for methods that are NOT const
+# [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
+# [ ] Overload: func(const char*) -> func(const char*), func(std::string)
+# -----------------------------------------------------------------------------
 # [ ] Generate copy/move assignment
 # [ ] namespace: Xml, Html
 #       huge problem! xmlDoc and htmlDoc refer to same struct and xmlReadDoc/htmlReadDoc will bind to the same class
 #       resulting in a name collision
 # [x] Make class methods 'const' based on constness of 'this' pointer
-# [ ] Also provide 'const' methods for methods that are NOT const
-# [ ] Methods matching *EatName* should unown the passed argument
-# [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
-# [ ] Overload: func(const char*) -> func(const char*), func(std::string)
 # [ ] Sometimes struct*/char* is reallocated! rebind cobj then!
 #     examples: xmlStrcat(), xmlXPathConvertBoolean()
 # [ ] Sometimes char* is reallocated but only if the returned pointer differs from original 'this' -> REBIND!
 #     examples: xmlBuildQName
+# [ ] Methods matching *EatName* should unown the passed argument
 # [ ] Error checking based on the function documentation
 # [ ] Enums: Rename them and put them into namespace (enum xmlStatus -> Xml::enum Status)
 # [ ] Meta::normalize_type should be memoized, since it's called very often
@@ -160,7 +161,20 @@ class Converter():
         # Convert to list (we need to sort)
         klasses = list(klasses.values())
 
-        print('#include<utility>')
+        print('''#include<utility>
+inline const char* to_const_char(std::nullptr_t)         { return nullptr; }
+inline const char* to_const_char(const char* s)          { return s; }
+inline const char* to_const_char(const unsigned char* s) { return reinterpret_cast<const char*>(s); }
+template<class T>
+inline const char* to_const_char(const T& s)             { return to_const_char(s.c_str()); }
+
+inline const unsigned char* to_const_unsigned_char(std::nullptr_t)         { return nullptr; }
+inline const unsigned char* to_const_unsigned_char(const unsigned char* s) { return s; }
+inline const unsigned char* to_const_unsigned_char(const char* s)          { return reinterpret_cast<const unsigned char*>(s); }
+template<class T>
+inline const unsigned char* to_const_unsigned_char(const T& s)             { return to_const_unsigned_char(s.c_str()); }
+        ''')
+
         print('// LibXML2 Includes')
         for f in self.doc.header_files:
             print('#include <libxml/%s.h>' % f)
@@ -294,6 +308,13 @@ def write_method(function, struct_type, meta):
             calling_args.append('std::forward<VArgs>(vargs)...')
         elif AST_Is_Void(arg, meta):
             pass
+        elif AST_Is_Ptr_To_Const_Char(arg, meta) or AST_Is_Ptr_To_Const_Unsigned_Char(arg, meta):
+            template_args.append('class T' + AST_Get_Declname(arg))
+            function_args.append('T%s %s' % (AST_Get_Declname(arg), AST_Get_Declname(arg)))
+            if AST_Is_Ptr_To_Const_Char(arg, meta):
+                calling_args.append('to_const_char(%s)' % AST_Get_Declname(arg))
+            else:
+                calling_args.append('to_const_unsigned_char(%s)' % AST_Get_Declname(arg))
         elif i == function.this:
             calling_args.append('cobj')
         else:
@@ -531,6 +552,20 @@ def AST_Is_Enum(ast, meta):
 def AST_Is_Void(ast, meta):
     norm = meta.normalize_type(ast)
     return type(norm.node) is c_ast.IdentifierType and norm.node.names == ['void']
+
+def AST_Is_Ptr_To_Const_Char(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.PtrDecl and \
+           type(norm.next.node) is c_ast.IdentifierType and \
+           'const' in norm.next.quals and \
+           norm.next.node.names == ['char']
+
+def AST_Is_Ptr_To_Const_Unsigned_Char(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.PtrDecl and \
+           type(norm.next.node) is c_ast.IdentifierType and \
+           'const' in norm.next.quals and \
+           norm.next.node.names == ['unsigned', 'char'] # TODO: Normalized
 
 def AST_Is_Ptr_To_Unsigned_Char(ast, meta):
     norm = meta.normalize_type(ast) # TODO NormalizedIdentifier

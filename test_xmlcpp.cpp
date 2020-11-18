@@ -5,10 +5,12 @@ using namespace std;
 const char* d = "<r> <node attr='value' /> </r>";
 const char* e = "//node";
 
+/* Notes: - never use NULL in this Wrapper class! */
+
 int main() {
-  auto doc   = Xml::Doc::readDoc(BAD_CAST d, NULL, NULL, 0);
+  auto doc   = Xml::Doc::readDoc(d, nullptr, nullptr, 0);
   auto xpath = doc.xPathNewContext();
-  auto expr  = Xml::XPathCompExpr::compile(BAD_CAST e);
+  auto expr  = Xml::XPathCompExpr::compile(e);
   auto resu  = expr.compiledEval(xpath);
 
 #if FOO
@@ -19,9 +21,9 @@ int main() {
   auto result = expr.CompiledEval(xpath);
 
   // Original C API
-  auto doc    = xmlReadDoc(d, NULL, NULL, 0);
+  auto doc    = xmlReadDoc(BAD_CAST d, NULL, NULL, 0);
   auto xpath  = xmlXPathNewContext(doc);
-  auto expr   = xmlXPathCompile(e);
+  auto expr   = xmlXPathCompile(BAD_CAST e);
   auto result = xmlXPathCompiledEval(expr, xpath);
   xmlFreeDoc(doc);
   xmlXPathFreeContext(xpath);
