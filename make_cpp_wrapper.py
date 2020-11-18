@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import sys, re
+import doc
 from copy        import deepcopy
 from tempfile    import NamedTemporaryFile
 from collections import defaultdict
@@ -52,31 +53,24 @@ class LibXML2_Class():
 class Converter():
     def __init__(self):
         self.api_xml_file = 'doc/libxml2-api.xml'
-        self.header_files = []
         self.funcs        = defaultdict(LibXML2_Function)
         self.ast          = None
         self.meta         = None
+        self.doc          = None
 
     def run(self):
-        self.read_api_xml()
+        self.doc = doc.API_Doc()
+        self.doc.read_xml(self.api_xml_file)
+        for func in self.doc.functions.values():
+            self.funcs[func.name].doc = func
         self.parse_header_files()
         self.add_ast_to_functions()
         self.other_stuff()
 
-    def read_api_xml(self):
-        for section in etree.parse(self.api_xml_file).getroot():
-            if section.tag == 'symbols':
-                for symbol in section:
-                    if symbol.tag == 'function':
-                        self.funcs[symbol.attrib['name']].doc = API_Doc_Function.from_xmlnode(symbol)
-            elif section.tag == 'files':
-                for file in section:
-                    self.header_files.append(file.attrib['name'])
-
     def parse_header_files(self):
         fh = NamedTemporaryFile('w', prefix='libxml-cpp', suffix='.h')
 
-        for f in self.header_files:
+        for f in self.doc.header_files:
             fh.write('#include <libxml/%s.h>\n' % f)
         fh.flush()
 
@@ -133,8 +127,13 @@ class Converter():
                 if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
                     f.this = 0
 
-        # Bind functions to a class depending on return type / this parameter
         klasses_ = defaultdict(LibXML2_Class)
+        for struct in self.doc.structs.values():
+            klasses_[struct.name]
+
+
+        # Bind functions to a class depending on return type / this parameter
+        #klasses_ = defaultdict(LibXML2_Class)
         for f in self.funcs:
             if f.this is None:
                 if f.own:
@@ -163,18 +162,18 @@ class Converter():
         klasses.sort(key=lambda k: len(k.type_dependencies))
 
         # TODO: Hack
-        klasses.append(LibXML2_Class('_xmlAutomataState'))
-        klasses.append(LibXML2_Class('_xmlAttribute'))
-        klasses.append(LibXML2_Class('_xmlElement'))
-        klasses.append(LibXML2_Class('_xmlNotation'))
-        klasses.append(LibXML2_Class('_xmlEntity'))
-        klasses.append(LibXML2_Class('_xmlParserNodeInfo'))
-        klasses.append(LibXML2_Class('_xmlID'))
-        klasses.append(LibXML2_Class('_xmlRef'))
+        #klasses.append(LibXML2_Class('_xmlAutomataState'))
+        #klasses.append(LibXML2_Class('_xmlAttribute'))
+        #klasses.append(LibXML2_Class('_xmlElement'))
+        #klasses.append(LibXML2_Class('_xmlNotation'))
+        #klasses.append(LibXML2_Class('_xmlEntity'))
+        #klasses.append(LibXML2_Class('_xmlParserNodeInfo'))
+        #klasses.append(LibXML2_Class('_xmlID'))
+        #klasses.append(LibXML2_Class('_xmlRef'))
 
         #for k in klasses: print(k.struct_type, k.type_dependencies)
 
-        for f in self.header_files:
+        for f in self.doc.header_files:
             print('#include <libxml/%s.h>' % f)
 
         print('namespace Xml {')
@@ -217,14 +216,14 @@ def write_class(self, klass):
     name = firstToUpper(strip_xml_prefix(klass.struct_type))
     print('template<bool Owning = 0>')
     print('class %s {' % name)
-    print(' %s *cobj;' % klass.struct_type)
+    print(' struct %s *cobj;' % klass.struct_type)
     print('public:')
     print(' inline ~%s() { if (Owning) free(cobj), cobj = NULL; }' % name)
     print(' inline %s(%s *ptr) : cobj(ptr) {}' % (name, klass.struct_type))
     print(' inline %s(const %s<0> &o) : cobj(o.cobj) {}' % (name, name))
     print(' inline %s(const %s<1> &o) : cobj(o.cobj) { if (Owning) {} }' % (name, name))
     print(' inline operator %s*() { return cobj; }' % klass.struct_type)
-    print(' inline %s<0> release() { }' % name) # TODO...
+    print(' inline %s<0> release() { return cobj; }' % name) # TODO...
 
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
@@ -339,65 +338,6 @@ firstToLower = lambda s: s[0].lower() + s[1:]
 firstToUpper = lambda s: s[0].upper() + s[1:]
 
 ast_to_c = c_generator.CGenerator().visit
-
-# =============================================================================
-# LibXML2 API Documentation Data Classes ======================================
-# =============================================================================
-
-class API_Doc_Function():
-    __slots__ = ('name', 'file', 'module', 'cond', 'info', 'returns', 'args')
-    def __init__(self, **kw):
-        for k, v in kw.items(): setattr(self, k, v)
-
-    def __repr__(self):
-        return "%s %s %s" % (self.returns, self.name, self.args)
-
-    @staticmethod
-    def from_xmlnode(node):
-        r = API_Doc_Function(
-            name     = node.attrib['name'],
-            file     = node.attrib['file'],
-            module   = node.attrib['module'],
-            cond     = None,
-            info     = None,
-            returns  = None,
-            args     = [])
-
-        for n in node:
-            if   n.tag == 'cond':   r.cond = n.text
-            elif n.tag == 'info':   r.info = n.text
-            elif n.tag == 'arg':    r.args.append(API_Doc_Arg.from_xmlnode(n))
-            elif n.tag == 'return': r.returns = API_Doc_Return.from_xmlnode(n)
-        return r
-
-class API_Doc_Arg():
-    __slots__ = ('name', 'type', 'info')
-    def __init__(self, **kw):
-        for k, v in kw.items(): setattr(self, k, v)
-
-    def __repr__(self):
-        return "%s %s" % (self.type, self.name)
-
-    @staticmethod
-    def from_xmlnode(node):
-        return API_Doc_Arg(
-            name=node.attrib['name'],
-            type=node.attrib['type'],
-            info=node.attrib['info'])
-
-class API_Doc_Return():
-    __slots__ = ('type', 'info')
-    def __init__(self, **kw):
-        for k, v in kw.items(): setattr(self, k, v)
-
-    def __repr__(self):
-        return self.type
-
-    @staticmethod
-    def from_xmlnode(node):
-        return API_Doc_Return(
-            type=node.attrib.get('type'),
-            info=node.attrib.get('info',''))
 
 # =============================================================================
 # AST Stuff ===================================================================
