@@ -10,10 +10,11 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
 # [ ] namespace: Xml, Html
+#       huge problem! xmlDoc and htmlDoc refer to same struct and xmlReadDoc/htmlReadDoc will bind to the same class
+#       resulting in a name collision
 # [x] Make class methods 'const' based on constness of 'this' pointer
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Methods matching *EatName* should unown the passed argument
-# [ ] In class destructors: Use matching free-function based on 'this' type instead of free()
 # [ ] Generate copy/move constructors
 # [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
 # [ ] Overload: func(const char*) -> func(const char*), func(std::string)
@@ -173,9 +174,6 @@ class Converter():
             write_class(self, klass)
         print('} // namespace LibXML_impl')
 
-        print(self.doc.typedefs)
-
-
         print('\nnamespace Xml {')
         for klass in klasses:
             name = firstToUpper(strip_xml_prefix(klass.struct_type))
@@ -208,13 +206,23 @@ def functionName_to_methodName(f, struct_type):
     if f == 'delete': return 'Delete' # TODO!
     return f
 
+def FreeFunction_For_StructType(self, struct_type):
+    for f in self.free_funcs:
+        try:
+            if struct_type == AST_Find_Struct_Name(f.ast.args.params[0], self.meta):
+                return f.doc.name
+        except:
+            pass
+
 def write_class(self, klass):
     name = firstToUpper(strip_xml_prefix(klass.struct_type))
+    free_func = FreeFunction_For_StructType(self, klass.struct_type)
     print('template<bool Owning = 0>')
     print('class %s {' % name)
     print(' struct %s *cobj;' % klass.struct_type)
     print('public:')
-    print(' inline ~%s() { if (Owning) free(cobj), cobj = NULL; }' % name)
+    if free_func:
+        print(' inline ~%s() { if (Owning) %s(cobj), cobj = NULL; }' % (name, free_func))
     print(' inline %s(%s *ptr) : cobj(ptr) {}' % (name, klass.struct_type))
     print(' inline %s(const %s<0> &o) : cobj(o.cobj) {}' % (name, name))
     print(' inline %s(const %s<1> &o) : cobj(o.cobj) { if (Owning) {} }' % (name, name))
