@@ -9,9 +9,8 @@ from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
+# [ ] namespace: Xml, Html
 # [x] Make class methods 'const' based on constness of 'this' pointer
-# [ ] Generate classes for ALL(!) structs
-# [ ] operator ptr_type()
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Methods matching *EatName* should unown the passed argument
 # [ ] In class destructors: Use matching free-function based on 'this' type instead of free()
@@ -127,64 +126,61 @@ class Converter():
                 if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
                     f.this = 0
 
-        klasses_ = defaultdict(LibXML2_Class)
+        # Get a all possible classes from documentation
+        klasses = {}
         for struct in self.doc.structs.values():
-            klasses_[struct.name]
-
+            klasses[struct.name] = LibXML2_Class(struct.name)
 
         # Bind functions to a class depending on return type / this parameter
-        #klasses_ = defaultdict(LibXML2_Class)
         for f in self.funcs:
             if f.this is None:
                 if f.own:
                     # No THIS but returns an owning ptr -> bind it to class of owning ptr
                     try:
-                        klasses_[AST_Find_Struct_Name(f.ast.type, self.meta)].functions.append(f)
+                        klasses[AST_Find_Struct_Name(f.ast.type, self.meta)].functions.append(f)
                     except:
                         #raise Exception(f.ast)
                         pass # TODO
             else:
                 try:
-                    klasses_[AST_Find_Struct_Name(f.ast.args.params[f.this], self.meta)].functions.append(f)
+                    klasses[AST_Find_Struct_Name(f.ast.args.params[f.this], self.meta)].functions.append(f)
                 except:
                     pass #print(f.ast.args.params[f.this])
 
         # Add struct dependencies to klass
-        klasses = list()
-        for name, klass in klasses_.items():
-            klass.struct_type = name
+        for klass in klasses.values():
             for function in klass.functions:
                 klass.type_dependencies |= AST_Find_All_Struct_Names(function.ast, self.meta)
-            klass.type_dependencies.discard(name)
-            klasses.append(klass)
+            klass.type_dependencies.discard(klass.struct_type)
 
-        # Blah
-        klasses.sort(key=lambda k: len(k.type_dependencies))
+        # =====================================================================
+        # Output ==============================================================
+        # =====================================================================
 
-        # TODO: Hack
-        #klasses.append(LibXML2_Class('_xmlAutomataState'))
-        #klasses.append(LibXML2_Class('_xmlAttribute'))
-        #klasses.append(LibXML2_Class('_xmlElement'))
-        #klasses.append(LibXML2_Class('_xmlNotation'))
-        #klasses.append(LibXML2_Class('_xmlEntity'))
-        #klasses.append(LibXML2_Class('_xmlParserNodeInfo'))
-        #klasses.append(LibXML2_Class('_xmlID'))
-        #klasses.append(LibXML2_Class('_xmlRef'))
+        # Convert to list (we need to sort)
+        klasses = list(klasses.values())
 
-        #for k in klasses: print(k.struct_type, k.type_dependencies)
-
+        print('// LibXML2 Includes')
         for f in self.doc.header_files:
             print('#include <libxml/%s.h>' % f)
 
-        print('namespace Xml {')
-
-        for klass in klasses:
+        print('\nnamespace LibXML_impl {')
+        for klass in sorted(klasses, key=lambda k: k.struct_type):
             print('template<bool> class %s;' % firstToUpper(strip_xml_prefix(klass.struct_type)))
-
+        print()
+        klasses.sort(key=lambda k: len(k.type_dependencies))
         for klass in klasses:
             write_class(self, klass)
+        print('} // namespace LibXML_impl')
 
-        print('}')
+        print(self.doc.typedefs)
+
+
+        print('\nnamespace Xml {')
+        for klass in klasses:
+            name = firstToUpper(strip_xml_prefix(klass.struct_type))
+            print('using %s = LibXML_impl::%s<0>;' % (name, name))
+        print('} // namespace Xml')
 
 def Function_Returns_Owning(f, meta):
     return AST_Is_Ptr_To_NonConst(f.ast.type, meta) and (
@@ -223,7 +219,7 @@ def write_class(self, klass):
     print(' inline %s(const %s<0> &o) : cobj(o.cobj) {}' % (name, name))
     print(' inline %s(const %s<1> &o) : cobj(o.cobj) { if (Owning) {} }' % (name, name))
     print(' inline operator %s*() { return cobj; }' % klass.struct_type)
-    print(' inline %s<0> release() { return cobj; }' % name) # TODO...
+    print(' inline %s<0> release() { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name)
 
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)

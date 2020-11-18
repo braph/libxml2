@@ -6,9 +6,9 @@ const char* d = "<r> <node attr='value' /> </r>";
 const char* e = "//node";
 
 int main() {
-  auto doc   = Xml::Doc<0>::readDoc(BAD_CAST d, NULL, NULL, 0);
+  auto doc   = Xml::Doc::readDoc(BAD_CAST d, NULL, NULL, 0);
   auto xpath = doc.xPathNewContext();
-  auto expr  = Xml::XPathCompExpr<0>::compile(BAD_CAST e);
+  auto expr  = Xml::XPathCompExpr::compile(BAD_CAST e);
   auto resu  = expr.compiledEval(xpath);
 
 #if FOO
