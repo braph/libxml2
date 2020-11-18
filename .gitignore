@@ -125,3 +125,6 @@ xstc/Makefile
 xstc/Makefile.in
 xstc/Tests
 xstc/xsts-*.tar.gz
+a.out
+libxml2-api.xml
+libxml2-refs.xml
