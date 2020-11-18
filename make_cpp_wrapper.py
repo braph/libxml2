@@ -9,13 +9,13 @@ from lxml        import etree
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
+# [ ] Generate copy/move assignment
 # [ ] namespace: Xml, Html
 #       huge problem! xmlDoc and htmlDoc refer to same struct and xmlReadDoc/htmlReadDoc will bind to the same class
 #       resulting in a name collision
 # [x] Make class methods 'const' based on constness of 'this' pointer
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Methods matching *EatName* should unown the passed argument
-# [ ] Generate copy/move constructors
 # [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
 # [ ] Overload: func(const char*) -> func(const char*), func(std::string)
 # [ ] Sometimes struct*/char* is reallocated! rebind cobj then!
@@ -23,11 +23,10 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 # [ ] Sometimes char* is reallocated but only if the returned pointer differs from original 'this' -> REBIND!
 #     examples: xmlBuildQName
 # [ ] Error checking based on the function documentation
-# [ ] Add 'noexcept' specifier on methods that don't report errors
-# [ ] Wrap va_args functions using variadic template methods
 # [ ] Enums: Rename them and put them into namespace (enum xmlStatus -> Xml::enum Status)
 # [ ] Meta::normalize_type should be memoized, since it's called very often
 # [ ] Add Iterators for children of Nodes
+# xmlSaveDoc() translates to Xml::Save::doc() *sigh*
 
 # =============================================================================
 # Main code ===================================================================
@@ -161,6 +160,7 @@ class Converter():
         # Convert to list (we need to sort)
         klasses = list(klasses.values())
 
+        print('#include<utility>')
         print('// LibXML2 Includes')
         for f in self.doc.header_files:
             print('#include <libxml/%s.h>' % f)
@@ -223,11 +223,11 @@ def write_class(self, klass):
     print('public:')
     if free_func:
         print(' inline ~%s() { if (Owning) %s(cobj), cobj = NULL; }' % (name, free_func))
-    print(' inline %s(%s *ptr) : cobj(ptr) {}' % (name, klass.struct_type))
-    print(' inline %s(const %s<0> &o) : cobj(o.cobj) {}' % (name, name))
-    print(' inline %s(const %s<1> &o) : cobj(o.cobj) { if (Owning) {} }' % (name, name))
-    print(' inline operator %s*() { return cobj; }' % klass.struct_type)
-    print(' inline %s<0> release() { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name)
+    print(' inline %s(%s *ptr) noexcept : cobj(ptr) {}' % (name, klass.struct_type))
+    print(' inline %s(%s<1> &&rhs) noexcept : cobj(rhs.cobj) { rhs.cobj = NULL; }' % (name, name))
+    #print(' inline %s& operator=()')
+    print(' inline operator %s*() const noexcept { return cobj; }' % klass.struct_type)
+    print(' inline %s<0> release() noexcept { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name)
 
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
@@ -245,7 +245,8 @@ def write_class(self, klass):
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
         print('#if', condition)
-        for f in functions: print(' ', write_method(f, klass.struct_type, self.meta))
+        for f in functions:
+            print(' ' + write_method(f, klass.struct_type, self.meta))
         print('#endif')
 
     print('};\n')
@@ -282,30 +283,48 @@ def make_return_type(ast, owns, meta):
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
 
-    for arg in function.ast.args.params:
-        if type(arg) is c_ast.EllipsisParam:
-            return '' # TODO: This skips ...
+    template_args = []
+    function_args = []
+    calling_args  = []
 
-    s  = 'inline '
-    if function.this is None:
-        s += 'static '
-    s += make_return_type(function.ast.type, function.own, meta)
-    s += ' '
-    s += functionName_to_methodName(function.doc.name, struct_type)
-    s += '('
-    s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
-    s += ')'
-    if function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta):
-        s += ' const'
-    s += ' { '
-    if function.doc.returns.type != 'void':
-        s += 'return '
-    s += function.doc.name
-    s += '('
-    s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
-    s += '); '
-    s += '}'
-    return s
+    for i, arg in enumerate(function.ast.args.params):
+        if type(arg) is c_ast.EllipsisParam:
+            template_args.append('typename... VArgs')
+            function_args.append('VArgs&&... vargs')
+            calling_args.append('std::forward<VArgs>(vargs)...')
+        elif AST_Is_Void(arg, meta):
+            pass
+        elif i == function.this:
+            calling_args.append('cobj')
+        else:
+            calling_args.append(AST_Get_Declname(arg))
+            function_args.append(ast_to_c(arg))
+
+    body = 'return ' if function.doc.returns.type != 'void' else ''
+    body += '%s(%s);' % (function.doc.name, ', '.join(calling_args))
+
+    tpl = ''
+    if template_args:
+        tpl = 'template<%s> ' % (', '.join(template_args))
+
+    return tpl + create_function(
+        make_return_type(function.ast.type, function.own, meta),
+        functionName_to_methodName(function.doc.name, struct_type),
+        function_args,
+        body,
+        inline = True,
+        static = function.this is None,
+        const =  function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta),
+        noexcept = True)
+
+def create_function(ret, name, args, body, inline=False, static=False, const=False, noexcept=False):
+    return '%s%s%s %s(%s) %s%s{ %s }' % (
+        'inline '   if inline else '',
+        'static '   if static else '',
+        ret, name, ', '.join(args),
+        'const '    if const else '',
+        'noexcept ' if noexcept else '',
+        body)
 
 # =============================================================================
 # Util ========================================================================
@@ -499,14 +518,19 @@ def AST_Find_Struct_Name(ast, meta): # TODO: rename this and exception blubber
 
 def AST_Get_Declname(node):
     T = type(node)
-    if   T is c_ast.TypeDecl: return node.declname
+    if   T is c_ast.Decl:     return node.name
+    elif T is c_ast.TypeDecl: return node.declname
     elif T is c_ast.FuncDecl: return AST_Get_Declname(node.type)
     elif T is c_ast.PtrDecl:  return AST_Get_Declname(node.type)
-    raise
+    raise Exception(node)
 
 def AST_Is_Enum(ast, meta):
     norm = meta.normalize_type(ast)
     return type(norm.node) is c_ast.Enum
+
+def AST_Is_Void(ast, meta):
+    norm = meta.normalize_type(ast)
+    return type(norm.node) is c_ast.IdentifierType and norm.node.names == ['void']
 
 def AST_Is_Ptr_To_Unsigned_Char(ast, meta):
     norm = meta.normalize_type(ast) # TODO NormalizedIdentifier

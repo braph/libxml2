@@ -684,3 +684,31 @@ def Decl_type(node):
     return re.sub('^[a-z]+[A-Z][a-z]+', '', s)
 
     if function.doc.name == 'xmlXPathNewContext': raise
+
+
+
+
+
+
+    s  = 'inline '
+    if function.this is None:
+        s += 'static '
+    s += make_return_type(function.ast.type, function.own, meta)
+    s += ' '
+    s += functionName_to_methodName(function.doc.name, struct_type)
+    s += '('
+    s += ', '.join([str(arg) for i, arg in enumerate(function.doc.args) if i != function.this])
+    s += ')'
+    if function.this is not None and AST_Is_Ptr_To_Const(function.ast.args.params[function.this], meta):
+        s += ' const'
+    s += ' noexcept'
+    s += ' { '
+    if function.doc.returns.type != 'void':
+        s += 'return '
+    s += function.doc.name
+    s += '('
+    s += ', '.join(['cobj' if i == function.this else arg.name for i, arg in enumerate(function.doc.args)])
+    s += '); '
+    s += '}'
+    return s
+
