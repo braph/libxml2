@@ -9,7 +9,7 @@ from collections import defaultdict
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
-# [ ] Add AST to LibXML2_Class, generate methods for getting fields
+# [ ] Add AST to LibXML2_Struct, generate methods for getting fields
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
 # [ ] Overload: func(const char*) -> func(const char*), func(std::string)
@@ -35,26 +35,34 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 # =============================================================================
 
 class LibXML2_Function():
-    ''' Data class that ties all available information about a function together '''
-
     __slots__ = ('doc', 'ast', 'own', 'this')
     def __init__(self, **kw):
-        for s in self.__slots__: setattr(self, s, kw.get(s, None))
+        self.doc  = None
+        self.ast  = None
+        self.own  = None
+        self.this = None
+        for key, value in kw.items():
+            setattr(self, key, value)
 
     def __repr__(self):
         return repr(self.doc)
 
-class LibXML2_Class():
-    __slots__ = ('struct_type', 'functions', 'type_dependencies')
-    def __init__(self, struct_type=None):
-        self.struct_type        = struct_type
+class LibXML2_Struct():
+    __slots__ = ('doc', 'ast', 'struct_type', 'functions', 'type_dependencies')
+    def __init__(self, **kw):
+        self.doc                = None
+        self.ast                = None
+        self.struct_type        = None
         self.functions          = []
         self.type_dependencies  = set()
+        for key, value in kw.items():
+            setattr(self, key, value)
 
 class Converter():
     def __init__(self):
         self.api_xml_file = 'doc/libxml2-api.xml'
-        self.funcs        = defaultdict(LibXML2_Function)
+        self.funcs        = {}
+        self.structs      = {}
         self.ast          = None
         self.meta         = None
         self.doc          = None
@@ -62,10 +70,18 @@ class Converter():
     def run(self):
         self.doc = doc.API_Doc()
         self.doc.read_xml(self.api_xml_file)
+
         for func in self.doc.functions.values():
-            self.funcs[func.name].doc = func
+            self.funcs[func.name] = LibXML2_Function(doc=func)
+
+        for struct in self.doc.structs.values():
+            self.structs[struct.name] = LibXML2_Struct(struct_type=struct.name, doc=struct)
+
+        self.structs.pop('_xmlGlobalState') # Shouldn't be accessible
+        self.structs.pop('_xmlSAXLocator')  # Makes problems atm
+
         self.parse_header_files()
-        self.add_ast_to_functions()
+        self.add_asts()
         self.other_stuff()
 
     def parse_header_files(self):
@@ -88,20 +104,24 @@ class Converter():
 
         self.meta = Meta(self.ast)
 
-    def add_ast_to_functions(self):
-        class FuncDefVisitor(c_ast.NodeVisitor):
+    def add_asts(self):
+        class Visitor(c_ast.NodeVisitor):
             def visit_FuncDecl(_, node):
-                self.funcs[AST_Get_Declname(node)].ast = node
-        FuncDefVisitor().visit(self.ast)
+                if AST_Get_Declname(node) in self.funcs:
+                    self.funcs[AST_Get_Declname(node)].ast = node
+
+            def visit_Struct(_, node):
+                if AST_Get_Declname(node) in self.structs:
+                    self.structs[AST_Get_Declname(node)].ast = node
+
+        Visitor().visit(self.ast)
 
     def other_stuff(self):
+        # Drop stuff that doesn't have an AST set
+        self.structs = {name: s for name, s in self.structs.items() if s.ast}
+        self.funcs   = {name: f for name, f in self.funcs.items()   if f.ast}
+
         self.funcs = list(self.funcs.values())
-
-        # Drop functions that don't have ast
-        self.missing_asts, self.funcs = partition(self.funcs, lambda f: not f.ast)
-
-        # Drop functions that don't have doc
-        self.missing_docs, self.funcs = partition(self.funcs, lambda f: not f.doc)
 
         # Functions inside the 'xmlstring' module are an edge case.
         # They are the only functions that don't operate on a pointer to struct.
@@ -128,10 +148,7 @@ class Converter():
                 if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
                     f.this = 0
 
-        # Get a all possible classes from documentation
-        klasses = {}
-        for struct in self.doc.structs.values():
-            klasses[struct.name] = LibXML2_Class(struct.name)
+        klasses = self.structs
 
         # Bind functions to a class depending on return type / this parameter
         for f in self.funcs:
@@ -174,7 +191,7 @@ inline const unsigned char* to_const_unsigned_char(const unsigned char* s) { ret
 inline const unsigned char* to_const_unsigned_char(const char* s)          { return reinterpret_cast<const unsigned char*>(s); }
 template<class T>
 inline const unsigned char* to_const_unsigned_char(const T& s)             { return to_const_unsigned_char(s.c_str()); }
-        ''')
+''')
 
         print('// LibXML2 Includes')
         for f in self.doc.header_files:
@@ -209,18 +226,6 @@ def Function_Returns_Owning(f, meta):
 def strip_xml_prefix(string):
     return re.sub('^(x|ht)ml', '', string.lstrip('_'))
 
-def functionName_to_methodName(f, struct_type):
-    f = strip_xml_prefix(f)
-    struct_type = strip_xml_prefix(struct_type)
-
-    for part in split_title_case(struct_type):
-        if f.startswith(part) and f[len(part)].isupper():
-            f = f[len(part):]
-
-    f = firstToLower(f)
-    if f == 'delete': return 'Delete' # TODO!
-    return f
-
 def FreeFunction_For_StructType(self, struct_type):
     for f in self.free_funcs:
         try:
@@ -230,7 +235,7 @@ def FreeFunction_For_StructType(self, struct_type):
             pass
 
 def write_class(self, klass):
-    name = firstToUpper(strip_xml_prefix(klass.struct_type))
+    name = structName_to_className(klass.struct_type)
     free_func = FreeFunction_For_StructType(self, klass.struct_type)
     print('template<bool Owning = 0>')
     print('class %s {' % name)
@@ -243,6 +248,18 @@ def write_class(self, klass):
     #print(' inline %s& operator=()')
     print(' inline operator %s*() const noexcept { return cobj; }' % klass.struct_type)
     print(' inline %s<0> release() noexcept { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name)
+
+    # Getter for fields
+    for field in (klass.ast.decls or []):
+        print(create_function(
+            make_return_type(field.type, False, self.meta),
+            'get'+AST_Get_Declname(field),
+            [],
+            'return cobj->%s;'%AST_Get_Declname(field),
+            inline = True,
+            static = False,
+            const =  False,
+            noexcept = True))
 
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
@@ -270,21 +287,21 @@ def make_return_type(ast, owns, meta):
     normalized = meta.normalize_type(ast)
     if type(normalized.node) == c_ast.PtrDecl:
         if type(normalized.next.node) == c_ast.Struct:
-            name = strip_xml_prefix(normalized.next.node.name)
+            name = structName_to_className(normalized.next.node.name)
             return '%s<%d-Owning*0>' % (name, bool(owns))
 
-        if type(normalized.next.node) == c_ast.FuncDecl:
-            return normalized.next.node.type.declname # TODO!!!!
+        #if type(normalized.next.node) == c_ast.FuncDecl:
+        #    return normalized.next.node.type.declname # TODO!!!!
 
-    if AST_Is_Enum(ast, meta):
-        # TODO: move enum to Xml:: and strip off Xml-Preifx
-        return ast.type.names[0] # TODO: handle this better
+    #if AST_Is_Enum(ast, meta):
+    #    # TODO: move enum to Xml:: and strip off Xml-Preifx
+    #    return ast.type.names[0] # TODO: handle this better
 
-    if AST_Is_Ptr_To_Unsigned_Char(ast, meta):
-        return 'xmlChar* ' # TODO: handle const
+    #if AST_Is_Ptr_To_Unsigned_Char(ast, meta):
+    #    return 'xmlChar* ' # TODO: handle const
 
-    if type(normalized.node) is c_ast.IdentifierType and normalized.node.names == ['unsigned','char']:
-        return 'xmlChar ' # TODO!!!!!!
+    #if type(normalized.node) is c_ast.IdentifierType and normalized.node.names == ['unsigned','char']:
+    #    return 'xmlChar ' # TODO!!!!!!
 
     ast = deepcopy(ast)
     class ClearDeclname(c_ast.NodeVisitor):
@@ -349,6 +366,26 @@ def create_function(ret, name, args, body, inline=False, static=False, const=Fal
         body)
 
 # =============================================================================
+# "Conversion Rules" ==========================================================
+# =============================================================================
+
+def functionName_to_methodName(f, struct_type):
+    f = strip_xml_prefix(f)
+    struct_type = strip_xml_prefix(struct_type)
+
+    for part in split_title_case(struct_type):
+        if f.startswith(part) and f[len(part)].isupper():
+            f = f[len(part):]
+
+    f = firstToLower(f)
+    if f == 'delete': return 'Delete' # TODO!
+    return f
+
+def structName_to_className(name):
+    return firstToUpper(strip_xml_prefix(name))
+
+
+# =============================================================================
 # Util ========================================================================
 # =============================================================================
 
@@ -410,6 +447,7 @@ def AST_Get_Declname(node):
     T = type(node)
     if   T is c_ast.Decl:     return node.name
     elif T is c_ast.TypeDecl: return node.declname
+    elif T is c_ast.Struct:   return node.name
     elif T is c_ast.FuncDecl: return AST_Get_Declname(node.type)
     elif T is c_ast.PtrDecl:  return AST_Get_Declname(node.type)
     raise Exception(node)
