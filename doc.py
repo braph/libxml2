@@ -7,13 +7,19 @@ from lxml import etree
 class API_Doc():
     def __init__(self):
         self.header_files = []
-        self.exports      = {}
         self.typedefs     = {}
         self.functions    = {}
         self.structs      = {}
 
-    def read_xml(self, file):
-        for section in etree.parse(file).getroot():
+    @staticmethod
+    def from_xmlfile(file):
+        return API_Doc.from_xmlnode(etree.parse(file).getroot())
+
+    @staticmethod
+    def from_xmlnode(node):
+        self = API_Doc()
+
+        for section in node:
             if section.tag == 'symbols':
                 for symbol in section:
                     if symbol.tag == 'function':
@@ -25,52 +31,28 @@ class API_Doc():
             elif section.tag == 'files':
                 for file in section:
                     self.header_files.append(file.attrib['name'])
-                    for node in file:
-                        if node.tag == 'exports':
-                            self.exports[node.attrib['symbol']] = node.attrib['type']
 
         # <struct name='xmlAttributeTable' type='struct _xmlHashTable'/>
-        # This create a typedef "xmlAttributeTable -> struct _xmlHashTable"
+        # This creates a typedef "xmlAttributeTable -> struct _xmlHashTable"
         for struct in self.structs.values():
             self.typedefs[struct.name] = Typedef(
                 name = struct.name, 
                 type = struct.type, 
                 file = struct.file)
 
+        # <struct name='xmlAttributeTable' type='struct _xmlHashTable'/>
+        # Flip 'name' and 'type' and rebuild self.structs.
         new = {}
         for struct in self.structs.values():
             struct.name = struct.type.replace('struct','').strip()
-            new[struct.name] = struct
+
+            # Insert struct - or overwrite it if it has <fields>
+            if struct.name not in new or len(struct.fields):
+                new[struct.name] = struct
         self.structs = new
 
-        # As the relation of struct.name and struct.type is more like a typedef
-        # we have to flip those.
-        #for name, struct in list(self.structs.values()):
+        return self
 
-
-        return
-
-        #type = symbol.attrib['type']
-        #struct = Struct.from_xmlnode(symbol)
-        #if struct.fields and type not in self.structs:
-        #    self.structs[type] = struct
-
-        #self.typedefs[symbol] = Typedef(
-        #    name = struct.name, 
-        #    type = struct.type, 
-        #    file = struct.file)
-
-        for symbol, type in self.exports.items():
-            if type == 'typedef':
-                struct = self.structs.get(symbol, None)
-                if struct:
-                    print('erm:', symbol, type, struct)
-                    self.typedefs[symbol] = Typedef(
-                        name = struct.name, 
-                        type = struct.type, 
-                        file = struct.file)
-
-                    self.structs.pop(symbol)
 
 class Function():
     __slots__ = ('name', 'file', 'module', 'cond', 'info', 'returns', 'args')
@@ -146,15 +128,11 @@ class Struct():
 
     @staticmethod
     def from_xmlnode(node):
-        r = Struct(
+        return Struct(
             name   = node.attrib['name'],
             file   = node.attrib['file'],
             type   = node.attrib['type'],
-            fields = [])
-
-        for n in node:
-            if n.tag == 'field': r.fields.append(Field.from_xmlnode(n))
-        return r
+            fields = [Field.from_xmlnode(n) for n in node if n.tag == 'field'])
 
 class Field():
     __slots__ = ('name', 'type', 'info')
@@ -192,10 +170,8 @@ class Typedef():
 
 
 if __name__ == "__main__":
-    d = API_Doc()
-    d.read_xml('doc/libxml2-api.xml')
-    #print(d.funcs)
-    # <exports symbol='xmlAttributeTable' type='typedef'/>
-    # <exports symbol='xmlAttributeTablePtr' type='typedef'/>
-    #print(d.structs)
-    print(d.typedefs)
+    d = API_Doc.from_xmlfile('doc/libxml2-api.xml')
+    for v in d.typedefs.values():  print(v)
+    for v in d.functions.values(): print(v)
+    for v in d.structs.values():   print(v)
+

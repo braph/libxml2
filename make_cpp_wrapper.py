@@ -3,6 +3,7 @@
 import sys, re
 import doc
 from meta import Meta
+from string      import Template
 from copy        import deepcopy
 from tempfile    import NamedTemporaryFile
 from collections import defaultdict
@@ -19,9 +20,9 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 #    Ich muss irgendwann die Klassen um Methoden erweitern, die NICHT automatisch generiert werden.
 #    Hmmmm vllt ... eine .cpp Datei? Mit $variablen? und ${code} oder so?
 # 
-#
+# [ ] (unsigned) char** -> some type that is traversable
 # [ ] How to provide custom functions to classes?
-# [ ] Add AST to LibXML2_Struct, generate methods for getting fields
+# [ ] Add AST to LibXML2_Struct, generate methods for getting members
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
 # [ ] Overload: func(const char*) -> func(const char*), func(std::string)
@@ -115,6 +116,17 @@ def Function_Argument_Is_This(arg, meta):
 def strip_xml_prefix(string):
     return re.sub('^(x|ht)ml', '', string.lstrip('_'))
 
+def create_struct_member_getter(member, meta):
+    return create_function(
+        make_return_type(member.type, False, meta),
+        'get' + AST_Get_Declname(member),
+        [],
+        'return cobj->%s;' % AST_Get_Declname(member),
+        inline = True,
+        static = False,
+        const =  False,
+        noexcept = True)
+
 # =============================================================================
 # Main code ===================================================================
 # =============================================================================
@@ -153,8 +165,7 @@ class Converter():
         self.doc          = None
 
     def run(self):
-        self.doc = doc.API_Doc()
-        self.doc.read_xml(self.api_xml_file)
+        self.doc = doc.API_Doc.from_xmlfile(self.api_xml_file)
 
         for func in self.doc.functions.values():
             self.funcs[func.name] = LibXML2_Function(doc=func)
@@ -263,38 +274,36 @@ class Converter():
         # Convert to list (we need to sort)
         klasses = list(klasses.values())
 
-        print('''#include<utility>
-inline const char* to_const_char(std::nullptr_t)         { return nullptr; }
-inline const char* to_const_char(const char* s)          { return s; }
-inline const char* to_const_char(const unsigned char* s) { return reinterpret_cast<const char*>(s); }
-template<class T>
-inline const char* to_const_char(const T& s)             { return to_const_char(s.c_str()); }
+        template     = None
+        placeholders = {}
+        with open('template.cpp') as fh:
+            template = Template(fh.read())
 
-inline const unsigned char* to_const_unsigned_char(std::nullptr_t)         { return nullptr; }
-inline const unsigned char* to_const_unsigned_char(const unsigned char* s) { return s; }
-inline const unsigned char* to_const_unsigned_char(const char* s)          { return reinterpret_cast<const unsigned char*>(s); }
-template<class T>
-inline const unsigned char* to_const_unsigned_char(const T& s)             { return to_const_unsigned_char(s.c_str()); }
-''')
+        placeholders['XML_INCLUDES'] = '\n'.join(
+            '#include <libxml/%s.h>' % f \
+                for f in self.doc.header_files)
 
-        print('// LibXML2 Includes')
-        for f in self.doc.header_files:
-            print('#include <libxml/%s.h>' % f)
+        placeholders['XML_CLASS_FORWARD_DECLARATIONS'] = '\n'.join(
+            'template<bool> class %s;' % structName_to_className(klass.struct_type) \
+                for klass in sorted(klasses, key=lambda k: k.struct_type))
 
-        print('\nnamespace LibXML_impl {')
-        for klass in sorted(klasses, key=lambda k: k.struct_type):
-            print('template<bool> class %s;' % structName_to_className(klass.struct_type))
-        print()
-        klasses.sort(key=lambda k: len(k.type_dependencies))
-        for klass in klasses:
-            write_class(self, klass)
-        print('} // namespace LibXML_impl')
+        # Sorting by type_dependencies is actually not needed...
+        klass_defs = ''
+        for klass in sorted(klasses, key=lambda k: len(k.type_dependencies)):
+            for line in write_class(self, klass):
+                klass_defs += line + '\n'
+        placeholders['XML_CLASS_DEFINITIONS'] = klass_defs
 
-        print('\nnamespace Xml {')
-        for klass in klasses:
-            name = structName_to_className(klass.struct_type)
-            print('using %s = LibXML_impl::%s<0>;' % (name, name))
-        print('} // namespace Xml')
+        #placeholders['XML_CLASS_DEFINITIONS'] = '\n'.join(
+        #    write_class(self, klass) \
+        #        for klass in sorted(klasses, key=lambda k: len(k.type_dependencies)))
+
+        placeholders['XML_USING_DECLARATIONS'] = '\n'.join(
+            'using %s = LibXML_impl::%s<0>;' % ((structName_to_className(klass.struct_type),)*2) \
+                for klass in sorted(klasses, key=lambda k: k.struct_type))
+
+        print(template.substitute(placeholders))
+
 
 def FreeFunction_For_StructType(self, struct_type):
     for f in self.free_funcs:
@@ -307,29 +316,21 @@ def FreeFunction_For_StructType(self, struct_type):
 def write_class(self, klass):
     name = structName_to_className(klass.struct_type)
     free_func = FreeFunction_For_StructType(self, klass.struct_type)
-    print('template<bool Owning = 0>')
-    print('class %s {' % name)
-    print(' struct %s *cobj;' % klass.struct_type)
-    print('public:')
+    yield 'template<bool Owning = 0>'
+    yield 'class %s {' % name
+    yield ' struct %s *cobj;' % klass.struct_type
+    yield 'public:'
     if free_func:
-        print(' inline ~%s() { if (Owning) %s(cobj), cobj = NULL; }' % (name, free_func))
-    print(' inline %s(%s *ptr) noexcept : cobj(ptr) {}' % (name, klass.struct_type))
-    print(' inline %s(%s<1> &&rhs) noexcept : cobj(rhs.cobj) { rhs.cobj = NULL; }' % (name, name))
-    #print(' inline %s& operator=()')
-    print(' inline operator %s*() const noexcept { return cobj; }' % klass.struct_type)
-    print(' inline %s<0> release() noexcept { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name)
+        yield ' inline ~%s() { if (Owning) %s(cobj), cobj = NULL; }' % (name, free_func)
+    yield ' inline %s(%s *ptr) noexcept : cobj(ptr) {}' % (name, klass.struct_type)
+    yield ' inline %s(%s<1> &&rhs) noexcept : cobj(rhs.cobj) { rhs.cobj = NULL; }' % (name, name)
+    #yield ' inline %s& operator=()'
+    yield ' inline operator %s*() const noexcept { return cobj; }' % klass.struct_type
+    yield ' inline %s<0> release() noexcept { if (Owning) { auto p = cobj; cobj = NULL; return p; } else { return cobj; } }' % name
 
-    # Getter for fields
-    for field in (klass.ast.decls or []):
-        print(create_function(
-            make_return_type(field.type, False, self.meta),
-            'get'+AST_Get_Declname(field),
-            [],
-            'return cobj->%s;'%AST_Get_Declname(field),
-            inline = True,
-            static = False,
-            const =  False,
-            noexcept = True))
+    # Getter for members
+    for member in (klass.ast.decls or []):
+        yield create_struct_member_getter(member, self.meta)
 
     # Sort alphabetically by function name
     klass.functions.sort(key=lambda f: f.doc.name)
@@ -342,16 +343,16 @@ def write_class(self, klass):
 
     # First, functions that have no preprocessor conditions
     for f in conditions.pop(None, []):
-        print(' '+ write_method(f, klass.struct_type, self.meta))
+        yield ' ' + write_method(f, klass.struct_type, self.meta)
 
     # Second, functions that have preprocessor conditions
     for condition, functions in conditions.items():
-        print('#if', condition)
+        yield '#if ' + condition
         for f in functions:
-            print(' '+ write_method(f, klass.struct_type, self.meta))
-        print('#endif')
+            yield ' ' + write_method(f, klass.struct_type, self.meta)
+        yield '#endif'
 
-    print('};\n')
+    yield '};\n'
 
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
