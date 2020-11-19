@@ -9,6 +9,18 @@ from collections import defaultdict
 from pycparser   import c_parser, c_ast, c_generator, parse_file
 
 # TODO:
+#
+# Ich wuerde gerne write_class() wirkich nur die Methoden *schreiben* lassen.
+# Also nicht *generieren*, nur *schreiben*. Warum geht das nicht?...
+#   Ich muesste die *generierten* methoden an LibXML2_Struct binden.
+#   Allerdings in bereits ausgeschriebener Form (->String) ... hm.
+#
+# Nachstes Problem:
+#    Ich muss irgendwann die Klassen um Methoden erweitern, die NICHT automatisch generiert werden.
+#    Hmmmm vllt ... eine .cpp Datei? Mit $variablen? und ${code} oder so?
+# 
+#
+# [ ] How to provide custom functions to classes?
 # [ ] Add AST to LibXML2_Struct, generate methods for getting fields
 # [ ] Also provide 'const' methods for methods that are NOT const
 # [ ] Overload: func1(a1), func2(a1, a2) -> func(a1), func(a1, a2)
@@ -31,6 +43,79 @@ from pycparser   import c_parser, c_ast, c_generator, parse_file
 # [ ] Memoize Meta::normalize_type()? Doesn't seem to improve performance?!
 
 # =============================================================================
+# "Conversion Rules" ==========================================================
+# =============================================================================
+
+def functionName_to_methodName(function_name, struct_type):
+    function_name = strip_xml_prefix(function_name)
+    struct_type = strip_xml_prefix(struct_type)
+
+    for part in split_title_case(struct_type):
+        if function_name.startswith(part) and function_name[len(part)].isupper():
+            function_name = function_name[len(part):]
+        else:
+            break
+
+    function_name = firstToLower(function_name)
+
+    if function_name == 'delete':
+        return 'Delete' # C++ keyword
+
+    return function_name
+
+def structName_to_className(name):
+    return firstToUpper(strip_xml_prefix(name))
+
+def Function_Returns_Owning(f, meta):
+    return AST_Is_Ptr_To_NonConst(f.ast.type, meta) and (
+        contains(f.doc.name, 'Create', 'New', 'Copy') or
+        contains(f.doc.returns.info,
+            'newly created',
+            'a new',
+            'the new',
+            'the resulting document tree',
+            'the caller has to free the object'
+            ))
+
+def make_return_type(ast, owns, meta):
+    normalized = meta.normalize_type(ast)
+    if type(normalized.node) == c_ast.PtrDecl:
+        if type(normalized.next.node) == c_ast.Struct:
+            name = structName_to_className(normalized.next.node.name)
+            return '%s<%d-Owning*0>' % (name, bool(owns))
+
+        #if type(normalized.next.node) == c_ast.FuncDecl:
+        #    return normalized.next.node.type.declname # TODO!!!!
+
+    #if AST_Is_Enum(ast, meta):
+    #    # TODO: move enum to Xml:: and strip off Xml-Preifx
+    #    return ast.type.names[0] # TODO: handle this better
+
+    #if AST_Is_Ptr_To_Unsigned_Char(ast, meta):
+    #    return 'xmlChar* ' # TODO: handle const
+
+    #if type(normalized.node) is c_ast.IdentifierType and normalized.node.names == ['unsigned','char']:
+    #    return 'xmlChar ' # TODO!!!!!!
+
+    ast = deepcopy(ast)
+    class ClearDeclname(c_ast.NodeVisitor):
+        def visit_TypeDecl(_, node):
+            node.declname = ''
+    ClearDeclname().visit(ast)
+    name = ast_to_c(c_ast.Typename('', [], ast))
+    return name
+    return strip_xml_prefix(name).replace('Ptr','') # TODO: replace(Ptr) needed?! this line needed?
+
+def Function_Is_Free(f, meta):
+    return 'Free' in f.doc.name and len(f.doc.args) == 1
+
+def Function_Argument_Is_This(arg, meta):
+    return AST_Is_Ptr_To_Struct(arg, meta) and arg.name == 'cur'
+
+def strip_xml_prefix(string):
+    return re.sub('^(x|ht)ml', '', string.lstrip('_'))
+
+# =============================================================================
 # Main code ===================================================================
 # =============================================================================
 
@@ -50,11 +135,11 @@ class LibXML2_Function():
 class LibXML2_Struct():
     __slots__ = ('doc', 'ast', 'struct_type', 'functions', 'type_dependencies')
     def __init__(self, **kw):
-        self.doc                = None
-        self.ast                = None
-        self.struct_type        = None
-        self.functions          = []
-        self.type_dependencies  = set()
+        self.doc               = None
+        self.ast               = None
+        self.struct_type       = None
+        self.functions         = []
+        self.type_dependencies = set()
         for key, value in kw.items():
             setattr(self, key, value)
 
@@ -129,24 +214,23 @@ class Converter():
         self.char_funcs, self.funcs = partition(self.funcs, lambda f: f.doc.module == 'xmlstring')
 
         # Free() functions contain 'Free' and have one arg
-        self.free_funcs, self.funcs = partition(self.funcs,
-            lambda f: 'Free' in f.doc.name and len(f.doc.args) == 1)
+        self.free_funcs, self.funcs = partition(self.funcs, lambda f: Function_Is_Free(f, self.meta))
 
         for f in self.funcs:
             # Own functions return Ptr
             if Function_Returns_Owning(f, self.meta):
                 f.own = True
 
-            # If we find a struct pointer named 'cur' use it as 'this' ...
-            for i, arg in enumerate(f.ast.args.params):
-                if AST_Is_Ptr_To_Struct(arg, self.meta) and arg.name == 'cur':
-                    f.this = i
-                    break
-
-            # ... else try to use the first arg as 'this' pointer
-            if f.this is None:
-                if len(f.doc.args) and AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
+            if len(f.doc.args):
+                # We assume that the first argument is a 'this' ptr
+                if AST_Is_Ptr_To_Struct(f.ast.args.params[0], self.meta):
                     f.this = 0
+
+                # If we find a struct pointer named 'cur' use it as 'this' ...
+                for i, arg in enumerate(f.ast.args.params):
+                    if Function_Argument_Is_This(arg, self.meta):
+                        f.this = i
+                        break
 
         klasses = self.structs
 
@@ -199,7 +283,7 @@ inline const unsigned char* to_const_unsigned_char(const T& s)             { ret
 
         print('\nnamespace LibXML_impl {')
         for klass in sorted(klasses, key=lambda k: k.struct_type):
-            print('template<bool> class %s;' % firstToUpper(strip_xml_prefix(klass.struct_type)))
+            print('template<bool> class %s;' % structName_to_className(klass.struct_type))
         print()
         klasses.sort(key=lambda k: len(k.type_dependencies))
         for klass in klasses:
@@ -208,23 +292,9 @@ inline const unsigned char* to_const_unsigned_char(const T& s)             { ret
 
         print('\nnamespace Xml {')
         for klass in klasses:
-            name = firstToUpper(strip_xml_prefix(klass.struct_type))
+            name = structName_to_className(klass.struct_type)
             print('using %s = LibXML_impl::%s<0>;' % (name, name))
         print('} // namespace Xml')
-
-def Function_Returns_Owning(f, meta):
-    return AST_Is_Ptr_To_NonConst(f.ast.type, meta) and (
-        contains(f.doc.name, 'Create', 'New', 'Copy') or
-        contains(f.doc.returns.info,
-            'newly created',
-            'a new',
-            'the new',
-            'the resulting document tree',
-            'the caller has to free the object'
-            ))
-
-def strip_xml_prefix(string):
-    return re.sub('^(x|ht)ml', '', string.lstrip('_'))
 
 def FreeFunction_For_StructType(self, struct_type):
     for f in self.free_funcs:
@@ -278,39 +348,10 @@ def write_class(self, klass):
     for condition, functions in conditions.items():
         print('#if', condition)
         for f in functions:
-            print(' ' + write_method(f, klass.struct_type, self.meta))
+            print(' '+ write_method(f, klass.struct_type, self.meta))
         print('#endif')
 
     print('};\n')
-
-def make_return_type(ast, owns, meta):
-    normalized = meta.normalize_type(ast)
-    if type(normalized.node) == c_ast.PtrDecl:
-        if type(normalized.next.node) == c_ast.Struct:
-            name = structName_to_className(normalized.next.node.name)
-            return '%s<%d-Owning*0>' % (name, bool(owns))
-
-        #if type(normalized.next.node) == c_ast.FuncDecl:
-        #    return normalized.next.node.type.declname # TODO!!!!
-
-    #if AST_Is_Enum(ast, meta):
-    #    # TODO: move enum to Xml:: and strip off Xml-Preifx
-    #    return ast.type.names[0] # TODO: handle this better
-
-    #if AST_Is_Ptr_To_Unsigned_Char(ast, meta):
-    #    return 'xmlChar* ' # TODO: handle const
-
-    #if type(normalized.node) is c_ast.IdentifierType and normalized.node.names == ['unsigned','char']:
-    #    return 'xmlChar ' # TODO!!!!!!
-
-    ast = deepcopy(ast)
-    class ClearDeclname(c_ast.NodeVisitor):
-        def visit_TypeDecl(_, node):
-            node.declname = ''
-    ClearDeclname().visit(ast)
-    name = ast_to_c(c_ast.Typename('', [], ast))
-    return name
-    return strip_xml_prefix(name).replace('Ptr','') # TODO: replace(Ptr) needed?! this line needed?
 
 def write_method(function, struct_type, meta):
     ''' Generate the code for a wrapped function '''
@@ -364,26 +405,6 @@ def create_function(ret, name, args, body, inline=False, static=False, const=Fal
         'const '    if const else '',
         'noexcept ' if noexcept else '',
         body)
-
-# =============================================================================
-# "Conversion Rules" ==========================================================
-# =============================================================================
-
-def functionName_to_methodName(f, struct_type):
-    f = strip_xml_prefix(f)
-    struct_type = strip_xml_prefix(struct_type)
-
-    for part in split_title_case(struct_type):
-        if f.startswith(part) and f[len(part)].isupper():
-            f = f[len(part):]
-
-    f = firstToLower(f)
-    if f == 'delete': return 'Delete' # TODO!
-    return f
-
-def structName_to_className(name):
-    return firstToUpper(strip_xml_prefix(name))
-
 
 # =============================================================================
 # Util ========================================================================
